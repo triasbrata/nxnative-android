@@ -4040,7 +4040,7 @@ enum { IPK_NPMAX = 16, IPK_NCMAX = 3 };
 static int ipk_np(void) { static int v; if (!v) { const char *e = getenv("DM_VK_IDXPOOL_KEEP_SLOTS"); v = e && atoi(e) > 0 ? atoi(e) : 8; if (v > IPK_NPMAX) v = IPK_NPMAX; } return v; }
 // The fallbacks by reason (cumulative; the memory watcher prints a second's worth when that second's fallback copies reach 32 MB): too big, pool not page-aligned, misaligned index
 // start, memory really low, untracked, refused pool, buffer not made; a slot's old pool in flight, no idle slot, no copy free; written since, write-back since; copies made and bytes
-enum { IPF_BIG, IPF_PGALIGN, IPF_ISZ, IPF_LOWMEM, IPF_UNTRACKED, IPF_REFUSED, IPF_ALLOC, IPF_SWAPFLIGHT, IPF_NOSLOT, IPF_NOCOPY, IPF_DIRTY, IPF_HWL, IPF_N };
+enum { IPF_NOPOOL, IPF_BIG, IPF_PGALIGN, IPF_ISZ, IPF_LOWMEM, IPF_UNTRACKED, IPF_REFUSED, IPF_ALLOC, IPF_SWAPFLIGHT, IPF_NOSLOT, IPF_NOCOPY, IPF_DIRTY, IPF_HWL, IPF_N };
 static _Atomic uint64_t g_ipf[IPF_N], g_ipf_copies, g_ipf_bytes;
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; uint64_t stamp, fence, hseq; int valid; } ipk_copy;   // hseq: the host write-back log at the sync (hwl)
 static struct { uint64_t base, size, regid, last; const void *span; ipk_copy c[IPK_NCMAX]; int cur; uint64_t cur_fence; int refused, hot; uint64_t refused_ns; } g_ipk[IPK_NPMAX];   // hot: syncs in a row that copied over half the pool
@@ -4094,7 +4094,7 @@ static int ipk_sync(int i, ipk_copy *c) {   // brings copy c of pool slot i up t
 }
 static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDeviceSize *o) {
     static uint64_t cap; if (!cap) { const char *e = getenv("DM_VK_IDXPOOL_ONCE_MB"); long mb = e && atol(e) > 0 ? atol(e) : 32; cap = (uint64_t)mb << 20; }
-    uint64_t psize = 0, base = pool_range(ibuf, &psize); if (!base || !n || psize > cap || ibuf + n > base + psize) { g_ipk_fb_other++; g_ipf[IPF_BIG]++; return 0; }
+    uint64_t psize = 0, base = pool_range(ibuf, &psize); if (!base || !n || psize > cap || ibuf + n > base + psize) { g_ipk_fb_other++; g_ipf[!base || !n || ibuf + n > base + psize ? IPF_NOPOOL : IPF_BIG]++; return 0; }
     static uint64_t pgm; if (!pgm) { long ps = sysconf(_SC_PAGESIZE); pgm = (uint64_t)(ps > 0 ? ps : 4096) - 1; }
     if ((base & pgm) || (psize & pgm)) { g_ipk_fb_other++; g_ipf[IPF_PGALIGN]++; return 0; }   // a host page shared with another range: its faults could stamp only the other one (grill-risk M4)
     if ((ibuf - base) % isz) { g_ipk_fb_other++; g_ipf[IPF_ISZ]++; return 0; }
@@ -4873,7 +4873,7 @@ static void mem_watch(void) {
           pup = up; ptm = tm; pring = rg; pheld = held; pskip = skip; pxn = xn; }
         { static uint64_t pb, pc, pr[IPF_N]; uint64_t b = atomic_load(&g_ipf_bytes), c = atomic_load(&g_ipf_copies);   // hm-fix-2f: the index-pool fallback copies of a heavy second, by reason
           if (hbase >= 0 && b - pb >= (32ull << 20) && nline++ < 300) {
-              static const char *nm[IPF_N] = {"too big", "pool not page-aligned", "index start misaligned", "memory really low", "untracked", "refused pool", "no buffer", "the slot's old pool in flight", "no idle slot", "no free copy", "written since the copy", "a write-back since"};
+              static const char *nm[IPF_N] = {"not in a pool (or past its end)", "pool over the size cap", "pool not page-aligned", "index start misaligned", "memory really low", "untracked", "refused pool", "no buffer", "the slot's old pool in flight", "no idle slot", "no free copy", "written since the copy", "a write-back since"};
               char t[512]; int k = 0; for (int r = 0; r < IPF_N && k < (int)sizeof t - 64; r++) { uint64_t v = atomic_load(&g_ipf[r]); if (v != pr[r]) k += snprintf(t + k, sizeof t - k, "%s %s %llu", k ? "," : "", nm[r], (unsigned long long)(v - pr[r])); }
               LOG("[mem] last second: GPU-indirect index pools copied into the ring %llu times, %.0f MB (DM_VK_IDXPOOL_KEEP %d, %d slots); why the kept copy was not used:%s",
                   (unsigned long long)(c - pc), (b - pb) / 1048576.0, idxpool_keep_mode(), ipk_np(), k ? t : " (not asked)"); }
