@@ -48,4 +48,7 @@ shader_half_clamp	on
 # Defaults for this game only (front_android.c; env.txt overrides each). Outdoors in Bloomfield (11-11, hm_next3, KEEP=0): 3.5-4.3 fps, recording 216-256 ms a frame, ~400 MB a frame of
 # index-pool copies for GPU-indirect indexed draws, ~6100 GPU-written lookups walking ~930k entries. RING_REUSE keeps the extra rings (the forest's 500 MB a frame of fresh rings went to
 # ~16 MB); IDXPOOL_KEEP keeps the index pools across frames (hm-fix-b: host write-backs seen); GW_PAD pads small GPU-written copies; GW_LCACHE caches the GPU-written lookups per submission.
-host_env	DM_VK_RING_REUSE=1 DM_VK_IDXPOOL_KEEP=1 DM_VK_GW_PAD=1 DM_VK_GW_LCACHE=1
+# hm-fix-2 (11-13 profile of hm-fix-all outdoors, 14 fps): 271 composes a frame each ended the render pass (407 passes a frame) and every pass begin cost the driver a calloc from scudo's
+# secondary allocator (mmap + memset, 25% of all CPU; the frees at the pool reset on dm-complete, munmap). GW_SHADOW gives the cull dispatches' instance lists, read 16 bytes in, an aligned
+# copy right after the dispatch; MALLOC_CACHE keeps 256 freed driver blocks instead of 32; WB_PREP unprotects the pages a write-back writes instead of a fault per page.
+host_env	DM_VK_RING_REUSE=1 DM_VK_IDXPOOL_KEEP=1 DM_VK_GW_PAD=1 DM_VK_GW_LCACHE=1 DM_VK_GW_SHADOW=1 DM_VK_WB_PREP=1 DM_MALLOC_CACHE=256

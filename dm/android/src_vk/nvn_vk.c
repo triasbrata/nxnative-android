@@ -23,6 +23,7 @@
 #include <math.h>
 #include <sched.h>
 #include <sys/resource.h>
+#include <malloc.h>
 
 // Every vkAllocateMemory / vkFreeMemory of this file goes through these (vk19.31): the bytes live in all, for the memory lines. The Adreno driver held about 500 MB more GPU memory
 // than the backend's own count (dumpsys gpu --gpumem: 1.07 GB for FINAL FANTASY RESONANCE against 530 MB of blocks and rings), outside the resident memory and against MemAvailable
@@ -640,10 +641,18 @@ static void pass_end_(int line); static int pass_begin(void); static int g_pass_
 // submission's exact entry over the read's range. The reads then fit that newer entry and are bound in place. A later write over the range in the submission is a newer entry
 // still (the read composes as before). Per-600 line 'vk: DM_VK_GW_SHADOW'
 static int gw_shadow_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_SHADOW"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_SHADOW=1: misaligned reads of a dispatch's range get an aligned copy made right after the dispatch"); } return v; }
-enum { NSHL = 1024 };
-static struct { uint64_t ea, es, ro, rs; } g_shl[NSHL]; static uint64_t g_shl_learn, g_shl_made;
-static void shl_learn(uint64_t ea, uint64_t es, uint64_t ro, uint64_t rs) { unsigned h = (unsigned)((ea >> 4 ^ ea >> 14) % NSHL); if (g_shl[h].ea != ea || g_shl[h].es != es || g_shl[h].ro != ro || g_shl[h].rs != rs) { g_shl[h].ea = ea; g_shl[h].es = es; g_shl[h].ro = ro; g_shl[h].rs = rs; g_shl_learn++; } }
-static int shl_find(uint64_t ea, uint64_t es, uint64_t *ro, uint64_t *rs) { unsigned h = (unsigned)((ea >> 4 ^ ea >> 14) % NSHL); if (g_shl[h].ea != ea || g_shl[h].es != es || g_shl[h].ro + g_shl[h].rs > es) return 0; *ro = g_shl[h].ro; *rs = g_shl[h].rs; return 1; }
+// hm-fix-2: two reads remembered per range (a slot of SHLW ways; the draws of the main and the shadow passes may read one list at two offsets). A new read takes a way that holds
+// another range, then the oldest. Counted per 600 frames: composes over this submission's dispatch ranges that had to end the open pass (g_shl_brk), and the reads behind them
+// that lie inside the dispatch's range (misaligned: what this switch takes) or not (past its end or before its start: it cannot)
+enum { NSHL = 1024, SHLW = 2 };
+static struct { uint64_t ea, es, ro, rs; } g_shl[NSHL][SHLW]; static uint8_t g_shl_rr[NSHL]; static uint64_t g_shl_learn, g_shl_made, g_shl_brk, g_shl_cin, g_shl_cout;
+static void shl_learn(uint64_t ea, uint64_t es, uint64_t ro, uint64_t rs) {
+    unsigned h = (unsigned)((ea >> 4 ^ ea >> 14) % NSHL); int w = -1;
+    for (int k = 0; k < SHLW; k++) if (g_shl[h][k].ea == ea && g_shl[h][k].es == es && g_shl[h][k].ro == ro && g_shl[h][k].rs == rs) return;   // known
+    for (int k = 0; k < SHLW && w < 0; k++) if (g_shl[h][k].ea != ea || g_shl[h][k].es != es) w = k;   // a way of another range (or empty)
+    if (w < 0) { w = g_shl_rr[h] % SHLW; g_shl_rr[h]++; }   // both hold this range: the older goes
+    g_shl[h][w].ea = ea; g_shl[h][w].es = es; g_shl[h][w].ro = ro; g_shl[h][w].rs = rs; g_shl_learn++; }
+static int shl_find(uint64_t ea, uint64_t es, int w, uint64_t *ro, uint64_t *rs) { unsigned h = (unsigned)((ea >> 4 ^ ea >> 14) % NSHL); if (g_shl[h][w].ea != ea || g_shl[h][w].es != es || g_shl[h][w].ro + g_shl[h][w].rs > es) return 0; *ro = g_shl[h][w].ro; *rs = g_shl[h][w].rs; return 1; }
 // H0: a read about to be composed (gw_compose), against the entry that sent it there: why it does not fit, by caller; the first 16 in full. Caller holds g_gwmu
 static void h0_compose(uint64_t addr, uint64_t size, VkDeviceSize align, const gw_t *e) {
     int nov = 0, cur = 0;
@@ -680,7 +689,7 @@ static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align)
         ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1; xr_raise(e->buf, g_fence + 1);
     }
     if (cur) {   // parts this submission's own dispatches wrote: copied here, in order, after them (outside a render pass: the open one is ended and begun again)
-        int was_open = g_pass_open_(); if (was_open) { pass_end(); g_h0_cmp_pass++; }
+        int was_open = g_pass_open_(); if (was_open) { pass_end(); g_h0_cmp_pass++; g_shl_brk++; }
         for (int x = 0; x < nord; x++) {   // oldest first by seq
             const gw_t *e = &g_gw[g_gw_ord[x]]; if (e->fence != g_fence + 1) continue;
             uint64_t lo = e->addr > addr ? e->addr : addr, hi = e->addr + e->size < addr + size ? e->addr + e->size : addr + size;
@@ -765,6 +774,7 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
             }
             atomic_fetch_add(&g_gw_held, 1);
         } else if (!fits) {   // this submission's own write, not covering the read (or at an offset the binding cannot take): composed (gw_compose)
+            if (inside) g_shl_cin++; else g_shl_cout++;
             if (inside && gw_shadow_on() && !e->exact) shl_learn(e->addr, e->size, addr - e->addr, size);   // DM_VK_GW_SHADOW: next time the dispatch is recorded, this read gets its own aligned copy
             if (may_hold) { if (h0_on()) h0_compose(addr, size, align, e); VkDeviceSize ro = gw_compose(addr, size, align < 16 ? 16 : align);
                             if (ro != VK_WHOLE_SIZE) { *buf = C->ring; *off = ro; if (p) *p = C->ringp + ro; g_gw_ci = g_ci; hit = 1; atomic_fetch_add(&g_gw_copied, 1); break; } }
@@ -871,6 +881,24 @@ static void snap_free(void *p, size_t n) {
 // as the Metal host does by command buffer (nvn_mtl.m rep_ticks), TIMESTAMP_TOP takes the submission's GPU start and the others its GPU end: the end is the completion (the
 // guest clock when the completion thread saw the fence), the start that minus the submission's GPU span. DM_VK_GPU_TS=0: one time for all, as before
 static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GPU_TS"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_GPU_TS=0: counter timestamps all take the completion time"); } return v; }
+// DM_VK_WB_PREP=1 (hm-fix-2; Harvest Moon's profile). The completion thread writes the GPU's results back into guest memory, and pages there are write-protected for the
+// dirty tracking: each first write to a page was a page fault, a signal, the handler and an mprotect (outdoors 324 faults a frame on dm-complete, ~4% of all CPU with the signal
+// chain). The pages a write-back will write are made writable first through the host pre-write hook (dm_guest_write_prepare: one mprotect per run of protected pages, the pages
+// counted as written, as the fault would). A dispatch's changed words (kind 5) prepare only the pages that get a changed word. Counted in the per-600 protection line (prepared pages)
+static int wb_prep_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_WB_PREP"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_WB_PREP=1: write-backs make their protected pages writable first"); } return v; }
+static void wb_prep_page(uint8_t *a, size_t left) {   // from a to the end of its page (or left bytes)
+    static uintptr_t pgm; if (!pgm) { long ps = sysconf(_SC_PAGESIZE); pgm = (uintptr_t)(ps > 0 ? ps : 4096) - 1; }
+    size_t n = (size_t)(((uintptr_t)a | pgm) + 1 - (uintptr_t)a); if (n > left) n = left; dm_guest_write_prepare(a, n); }
+static void wb_prep(const post_t *p) {
+    switch (p->kind) {
+    case 1: dm_guest_write_prepare(p->dst, 4); break;
+    case 2: dm_guest_write_prepare((void *)(uintptr_t)p->addr, 16); break;
+    case 3: dm_guest_write_prepare(p->dst, p->n); break;
+    case 4: if (p->addr) dm_guest_write_prepare((void *)(uintptr_t)p->addr, 16); break;
+    case 6: if (p->v) dm_guest_write_prepare(p->dst, (size_t)(p->v - 1) * p->mode + p->type); break;
+    default: break;   // kind 5: by page, where a word changes
+    }
+}
 static void ctx_complete(ctx_t *c) {
     if (c->nh0ip) {   // H0: the GPU-written indirect arguments this submission drew with (vertex or index count, instances)
         static uint64_t prev; uint64_t tot = 0, mx = atomic_load(&g_h0_ii_max);
@@ -908,8 +936,10 @@ static void ctx_complete(ctx_t *c) {
         if (vkGetQueryPoolResults(g_dev, c->tq, 0, n, n * 8, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             for (uint32_t i = 0; i + 1 < n; i += 2) if (t[i + 1] > t[i]) { uint64_t ns = (uint64_t)((double)(t[i + 1] - t[i]) * g_props.limits.timestampPeriod);
                 atomic_fetch_add(&g_gpu_kind_ns[c->tkind[i / 2] % 3], ns); gsig_add(c->tsig[i / 2], ns, c->tdraws[i / 2]); } }
+    int wbp = wb_prep_on();
     for (int i = 0; i < c->npost; i++) {
         post_t *p = &c->post[i];
+        if (wbp) wb_prep(p);   // DM_VK_WB_PREP: the protected pages it writes made writable first (no page fault per page)
         if (p->kind == 1) { volatile uint32_t *v = p->dst; if (p->mode == 1) *v += p->v; else *v = p->v; }
         else if (p->kind == 2) { uint64_t t = p->type == 0x10 ? t_top : t_end, rec[2] = {p->type == 0 || p->type == 0x10 ? t : 0, t}; memcpy((void *)p->addr, rec, sizeof rec); }
         else if (p->kind == 4) {   // a segment of counted draws: added to the queue's samples-passed counter (submission order: one completion thread), written out when addr is a report
@@ -926,7 +956,8 @@ static void ctx_complete(ctx_t *c) {
                 if (chain_snap_mode() == 2) { uint64_t kept = 0, both = 0;
                     for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(dst + q, snap + q, 4)) { if (!memcmp(now + q, snap + q, 4)) kept++; else both++; }
                     atomic_fetch_add(&g_cs_kept_w, kept); atomic_fetch_add(&g_cs_both_w, both); } }
-            for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { memcpy(dst + i, now + i, 4); nw++; }
+            uintptr_t wpg = UINTPTR_MAX;   // DM_VK_WB_PREP: the page last made writable (only pages with a changed word are)
+            for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { if (wbp && ((uintptr_t)(dst + i) >> 12) != wpg) { wpg = (uintptr_t)(dst + i) >> 12; wb_prep_page(dst + i, p->n - i); } memcpy(dst + i, now + i, 4); nw++; }
             for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
             // Its entries end here, not at gw_expire below (vk19.58): guest memory holds the GPU's words and the CPU's rewrites now, so a later read copies it from there.
             // Only the snapshot used to be cleared, and the entry lived on until the rest of the submission was written back: a read in between bound the ring's bytes
@@ -1148,6 +1179,14 @@ static void vk_init_(void) {
         if (!p_begin_rendering || !p_end_rendering) g_dynrend = 0;
     }
     { const char *e = getenv("DM_VK_CTX"); if (e && *e) { int n = atoi(e); NCTX = n < 4 ? 4 : n > NCTX_MAX ? NCTX_MAX : n; } LOG("vk: %d submission contexts (DM_VK_CTX)", NCTX); }
+    // DM_MALLOC_CACHE=N[:MB] (hm-fix-2; Harvest Moon's profile N=256). The Adreno driver allocates a block per render pass from scudo's secondary allocator (larger than its
+    // size classes) and frees them all when the command pool is reset: scudo keeps 32 freed blocks of at most 2 MB by default, so with ~400 passes a submission most were
+    // unmapped at the reset (dm-complete: munmap) and mapped again at the next pass (mmap, prctl naming, page faults). N raises the number of freed blocks kept (scudo takes at
+    // most 256), MB the largest kept. The driver's block size: the 'driver memory over a pass begin' lines
+    { const char *e = getenv("DM_MALLOC_CACHE"); if (e && *e) { int n = atoi(e); const char *c = strchr(e, ':'); long mb = c ? atol(c + 1) : 0; int okn = 0, oks = -1;
+        if (n > 0) { okn = mallopt(M_CACHE_COUNT_MAX, n); if (!okn && n > 256) okn = mallopt(M_CACHE_COUNT_MAX, n = 256); }
+        if (mb > 0) oks = mallopt(M_CACHE_SIZE_MAX, (int)(mb << 20));
+        LOG("vk: DM_MALLOC_CACHE=%s: freed blocks the allocator keeps %d (%s), largest kept %ld MB (%s)", e, n, okn ? "taken" : "refused", mb, oks < 0 ? "default" : oks ? "taken" : "refused"); } }
     for (int i = 0; i < NCTX; i++) ctx_init(i);
     dummies();
     pthread_t th; if (pthread_create(&th, NULL, completion_thread, NULL)) die("Vulkan: cannot start the completion thread"); pthread_detach(th);
@@ -2627,7 +2666,13 @@ static int pass_begin(void) {
         VkSampleCountFlagBits sc = P.n && P.ct[0] ? P.ct[0]->ci.samples : P.dt ? P.dt->ci.samples : VK_SAMPLE_COUNT_1_BIT; if (!sc) sc = VK_SAMPLE_COUNT_1_BIT;
         P.rpd = d; C->prim = C->cb; C->cb = sec_begin(&d, sc); ds_last_newcb(); P.open = 1; return 1;
     }
+    // hm-fix-2: what the driver allocates for a pass (the outdoor profile: vkCmdBeginRendering -> calloc -> scudo's secondary allocator, mmap and memset, 25% of all CPU).
+    // One pass in 1024, 12 lines in all: malloc's own counts before and after (another thread's allocation at the same moment shows too; the smallest is the driver's)
+    static uint64_t pb_n; static int pb_logs; int pb = (++pb_n & 1023) == 0 && pb_logs < 12; struct mallinfo pm0 = {0}; if (pb) pm0 = mallinfo();
     VkFramebuffer fb = rp_begin(C->cb, &d); P.open = 1;
+    if (pb) { struct mallinfo pm1 = mallinfo(); pb_logs++;
+        LOG("vk: driver memory over a pass begin (pass %llu of this run, %ux%u, %d targets): allocated %+lld bytes, mapped by the secondary allocator %+lld bytes; in use %llu MB",
+            (unsigned long long)pb_n, d.w, d.h, d.n, (long long)pm1.uordblks - (long long)pm0.uordblks, (long long)pm1.hblkhd - (long long)pm0.hblkhd, (unsigned long long)pm1.uordblks >> 20); }
     if (fb) { if (C->nfb == C->cfb) { C->cfb = C->cfb ? 2 * C->cfb : 256; C->fb = realloc(C->fb, C->cfb * sizeof *C->fb); } C->fb[C->nfb++] = fb; }
     return 1;
 }
@@ -4536,11 +4581,15 @@ static void dispatch(const p_dispatch *d) {
     }
     g_gw_add_dfr = 0;
     if (gw_shadow_on() && !dfr) for (int i = 0; i < g_nwb; i++) {   // DM_VK_GW_SHADOW: the remembered misaligned reads of these ranges, copied aligned now (after barrier_cs, no pass open)
-        gw_t *w = &g_wb[i]; uint64_t ro, rs; if (!w->buf || !shl_find(w->addr, w->size, &ro, &rs)) continue;
-        VkDeviceSize al = g_props.limits.minStorageBufferOffsetAlignment > 256 ? g_props.limits.minStorageBufferOffsetAlignment : 256;
-        VkDeviceSize o = ring_alloc(rs, al); if (o == VK_WHOLE_SIZE) continue;
-        VkBufferCopy bc = {w->off + ro, o, rs}; vkCmdCopyBuffer(C->cb, w->buf, C->ring, 1, &bc); barrier_xfer(C->cb);
-        gw_add(w->addr + ro, rs, C->ring, o, C->ringp + o, g_fence + 1, g_ci, NULL, 1); g_shl_made++;
+        gw_t *w = &g_wb[i]; if (!w->buf) continue;
+        uint64_t dro[SHLW], drs[SHLW]; int nd = 0;
+        for (int k = 0; k < SHLW; k++) { uint64_t ro, rs; if (!shl_find(w->addr, w->size, k, &ro, &rs)) continue;
+            int ov = 0; for (int j = 0; j < nd; j++) if (ro < dro[j] + drs[j] && dro[j] < ro + rs) ov = 1;   // overlapping another way's copy: the newer would hide the older from its reads
+            if (ov) continue;
+            VkDeviceSize al = g_props.limits.minStorageBufferOffsetAlignment > 256 ? g_props.limits.minStorageBufferOffsetAlignment : 256;
+            VkDeviceSize o = ring_alloc(rs, al); if (o == VK_WHOLE_SIZE) continue;
+            VkBufferCopy bc = {w->off + ro, o, rs}; vkCmdCopyBuffer(C->cb, w->buf, C->ring, 1, &bc); barrier_xfer(C->cb);
+            gw_add(w->addr + ro, rs, C->ring, o, C->ringp + o, g_fence + 1, g_ci, NULL, 1); g_shl_made++; dro[nd] = ro; drs[nd] = rs; nd++; }
     }
     g_stat_draws++;
 }
@@ -5964,7 +6013,8 @@ static void h0_lines(void) {
     if (idxpool_keep_mode()) { LOG("vk: DM_VK_IDXPOOL_KEEP per frame over the last 600: draws bound to a kept copy %.1f; syncs %.2f (whole copies %.3f, pages copied %.1f = %.2f MB); left to the old copy: copy in flight %.2f, written since the copy %.2f, a host write-back since %.2f, other (untracked, too big, pressure) %.2f; pages copied for host write-backs %.1f; verify differences %.2f; kept %.0f MB",
                                    g_ipk_hit / 600.0, g_ipk_syncs / 600.0, g_ipk_full / 600.0, g_ipk_pages / 600.0, g_ipk_pages * 4096.0 / 600.0 / 1048576.0, g_ipk_fb_flight / 600.0, g_ipk_fb_dirty / 600.0, g_ipk_fb_hwl / 600.0, g_ipk_fb_other / 600.0, g_ipk_hwl_pages / 600.0, g_ipk_bad / 600.0, g_ipk_bytes_live / 1048576.0);
                                g_ipk_hit = g_ipk_syncs = g_ipk_full = g_ipk_pages = g_ipk_fb_flight = g_ipk_fb_dirty = g_ipk_fb_other = g_ipk_bad = g_ipk_fb_hwl = g_ipk_hwl_pages = 0; }
-    if (gw_shadow_on()) { LOG("vk: DM_VK_GW_SHADOW per frame over the last 600: aligned copies made after dispatches %.1f, reads remembered (new or changed) %.2f", g_shl_made / 600.0, g_shl_learn / 600.0); g_shl_made = g_shl_learn = 0; }
+    LOG("vk: DM_VK_GW_SHADOW %d per frame over the last 600: aligned copies made after dispatches %.1f, reads remembered (new or changed) %.2f; composes over this submission's dispatch ranges %.1f (inside the range, misaligned %.1f; past its end or before its start %.1f), passes ended for composes %.1f",
+        gw_shadow_on(), g_shl_made / 600.0, g_shl_learn / 600.0, (g_shl_cin + g_shl_cout) / 600.0, g_shl_cin / 600.0, g_shl_cout / 600.0, g_shl_brk / 600.0); g_shl_made = g_shl_learn = g_shl_brk = g_shl_cin = g_shl_cout = 0;
     if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f, this submission's %.1f; windows retired by an in-stream write %.1f (exact entries left from their parts %.1f); not padded: no pool %.1f, this submission's non-exact or overlapping GPU writes there (or newer than the window) %.1f, no room or too many parts %.1f; GPU-written entries forgotten at the cap of %d %llu",
                            g_pad_n / 600.0, g_pad_into / 600.0, g_pad_over / 600.0, g_pad_cur / 600.0, g_pad_retired / 600.0, g_pad_parts / 600.0, g_pad_why[1] / 600.0, g_pad_why[2] / 600.0, (g_pad_why[3] + g_pad_why[4]) / 600.0, (int)NGW, (unsigned long long)g_gw_dropped); g_pad_n = g_pad_into = g_pad_over = g_pad_cur = g_pad_retired = g_pad_parts = 0; memset(g_pad_why, 0, sizeof g_pad_why); }
     if (idxpool_once_mode()) { LOG("vk: DM_VK_IDXPOOL_ONCE per frame over the last 600: pool copies %.2f (%.2f MB), draws bound to one %.1f, left to the old copy %.2f, copied again after a write-back landed in it %.2f, verify differences %.2f",
