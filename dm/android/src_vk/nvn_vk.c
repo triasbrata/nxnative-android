@@ -437,7 +437,7 @@ static int stale_patch_on(void) { return stale_patch_mode() != 0; }
 // the CPU's rewrites (gw_cpu_dirty / gw_patch). Each write-back also puts the words it wrote into the snapshots of the later live entries over the same bytes, so a snapshot keeps
 // meaning "guest memory without the CPU's writes since": an earlier submission's write-back is not taken for a CPU rewrite. =2: as 1, plus counts at each chained write-back of
 // the CPU's words kept (which the whole write-back overwrote before) and of words both the CPU and the GPU wrote (the GPU's kept, as before). Per-600 line 'vk: chained GPU-written ranges'
-static int chain_snap_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_CHAIN_SNAP"); v = e ? atoi(e) : 0; if (v < 0 || v > 3) v = 1;
+static int chain_snap_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_CHAIN_SNAP"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 1;
     if (v) LOG("vk: DM_VK_GW_CHAIN_SNAP=%d: a dispatch's range bound from a running submission's GPU-written range gets a snapshot and goes back by changed words%s", v, v == 2 ? " (with counts of the CPU's words kept)" : ""); } return v; }
 static uint64_t g_cs_n, g_cs_b, g_cs_b2b;   // chained ranges given a snapshot (recording thread); GPU-written buffer copies whose CPU-side bytes went into live snapshots
 static _Atomic uint64_t g_cs_prop_b, g_cs_prop_n, g_cs_kept_w, g_cs_both_w, g_cs_wb_n;   // completion: bytes put into later snapshots (writes), CPU words kept, words both wrote, chained write-backs
@@ -886,8 +886,9 @@ static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = get
 // chain). The pages a write-back will write are made writable first through the host pre-write hook (dm_guest_write_prepare: one mprotect per run of protected pages, the pages
 // counted as written, as the fault would). A dispatch's changed words (kind 5) prepare only the pages that get a changed word. Counted in the per-600 protection line (prepared pages)
 static int wb_prep_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_WB_PREP"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_WB_PREP=1: write-backs make their protected pages writable first"); } return v; }
+static uintptr_t wb_pgm(void) { static uintptr_t pgm; if (!pgm) { long ps = sysconf(_SC_PAGESIZE); pgm = (uintptr_t)(ps > 0 ? ps : 4096) - 1; } return pgm; }   // the page size - 1
 static void wb_prep_page(uint8_t *a, size_t left) {   // from a to the end of its page (or left bytes)
-    static uintptr_t pgm; if (!pgm) { long ps = sysconf(_SC_PAGESIZE); pgm = (uintptr_t)(ps > 0 ? ps : 4096) - 1; }
+    uintptr_t pgm = wb_pgm();
     size_t n = (size_t)(((uintptr_t)a | pgm) + 1 - (uintptr_t)a); if (n > left) n = left; dm_guest_write_prepare(a, n); }
 static void wb_prep(const post_t *p) {
     switch (p->kind) {
@@ -957,7 +958,7 @@ static void ctx_complete(ctx_t *c) {
                     for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(dst + q, snap + q, 4)) { if (!memcmp(now + q, snap + q, 4)) kept++; else both++; }
                     atomic_fetch_add(&g_cs_kept_w, kept); atomic_fetch_add(&g_cs_both_w, both); } }
             uintptr_t wpg = UINTPTR_MAX;   // DM_VK_WB_PREP: the page last made writable (only pages with a changed word are)
-            for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { if (wbp && ((uintptr_t)(dst + i) >> 12) != wpg) { wpg = (uintptr_t)(dst + i) >> 12; wb_prep_page(dst + i, p->n - i); } memcpy(dst + i, now + i, 4); nw++; }
+            for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { if (wbp && ((uintptr_t)(dst + i) & ~wb_pgm()) != wpg) { wpg = (uintptr_t)(dst + i) & ~wb_pgm(); wb_prep_page(dst + i, p->n - i); } memcpy(dst + i, now + i, 4); nw++; }
             for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
             // Its entries end here, not at gw_expire below (vk19.58): guest memory holds the GPU's words and the CPU's rewrites now, so a later read copies it from there.
             // Only the snapshot used to be cleared, and the entry lived on until the rest of the submission was written back: a read in between bound the ring's bytes
@@ -1179,7 +1180,7 @@ static void vk_init_(void) {
         if (!p_begin_rendering || !p_end_rendering) g_dynrend = 0;
     }
     { const char *e = getenv("DM_VK_CTX"); if (e && *e) { int n = atoi(e); NCTX = n < 4 ? 4 : n > NCTX_MAX ? NCTX_MAX : n; } LOG("vk: %d submission contexts (DM_VK_CTX)", NCTX); }
-    // DM_MALLOC_CACHE=N[:MB] (hm-fix-2; Harvest Moon's profile N=256). The Adreno driver allocates a block per render pass from scudo's secondary allocator (larger than its
+    // DM_MALLOC_CACHE=N[:MB] (hm-fix-2; Harvest Moon's profile 128:2: worst case 256 MB idle, released by M_PURGE in the trim under real pressure). The Adreno driver allocates a block per render pass from scudo's secondary allocator (larger than its
     // size classes) and frees them all when the command pool is reset: scudo keeps 32 freed blocks of at most 2 MB by default, so with ~400 passes a submission most were
     // unmapped at the reset (dm-complete: munmap) and mapped again at the next pass (mmap, prctl naming, page faults). N raises the number of freed blocks kept (scudo takes at
     // most 256), MB the largest kept. The driver's block size: the 'driver memory over a pass begin' lines
@@ -4555,6 +4556,7 @@ static void dispatch(const p_dispatch *d) {
     barrier_cs(C->cb);
     }
     g_gw_add_dfr = dfr;   // its written ranges: a draw reading one records the deferred dispatches first
+    const uint8_t *wsnap[16] = {0};   // DM_VK_GW_SHADOW: each range's snapshot, for its aligned copies (a slice of it)
     for (int i = 0; i < g_nwb; i++) {
         gw_t *w = &g_wb[i]; int from_gw = w->fence != 0;
         // Back into guest memory at completion, only what the GPU changed. The GPU writes the bytes a shader stores and no others: the whole range written back put the bytes the
@@ -4573,6 +4575,7 @@ static void dispatch(const p_dispatch *d) {
             memcpy(snap, (const void *)(uintptr_t)w->addr, w->size); chained = 1; g_cs_n++; g_cs_b += w->size; }
         // The range is the GPU's until the submission completes (gw_find), with the bytes it started from to tell the CPU's later rewrites (gw_cpu_dirty)
         gw_add(w->addr, w->size, w->buf, w->off, w->p, g_fence + 1, w->ci, snap ? snap : dsnap, 0);   // this submission's fence value (mtl_sub_commit assigns g_fence + 1)
+        if (i < 16) wsnap[i] = snap ? snap : dsnap;
         if (dup) continue;
         if (snap) post_add((post_t){5, (void *)(uintptr_t)w->addr, (uint32_t)chained, 0, (uint64_t)(uintptr_t)snap, 0, w->p, w->size});   // mode 1: a chained range
         else {   // H0: a chained range (no snapshot) goes back whole; the guest's bytes now are kept aside (measurement only) to count what the CPU writes meanwhile that the write-back overwrites
@@ -4589,7 +4592,9 @@ static void dispatch(const p_dispatch *d) {
             VkDeviceSize al = g_props.limits.minStorageBufferOffsetAlignment > 256 ? g_props.limits.minStorageBufferOffsetAlignment : 256;
             VkDeviceSize o = ring_alloc(rs, al); if (o == VK_WHOLE_SIZE) continue;
             VkBufferCopy bc = {w->off + ro, o, rs}; vkCmdCopyBuffer(C->cb, w->buf, C->ring, 1, &bc); barrier_xfer(C->cb);
-            gw_add(w->addr + ro, rs, C->ring, o, C->ringp + o, g_fence + 1, g_ci, NULL, 1); g_shl_made++; dro[nd] = ro; drs[nd] = rs; nd++; }
+            // the source's snapshot slice (review of hm-fix-2): the CPU's rewrites since are patched into a later read of the copy as into one of the dispatch's range
+            // (gw_cpu_dirty, gw_patch, gw_snap_follow), and the dispatch's write-back ends the copy's entry with its own (the kind-5 loop: snap inside that snapshot)
+            gw_add(w->addr + ro, rs, C->ring, o, C->ringp + o, g_fence + 1, g_ci, i < 16 && wsnap[i] ? wsnap[i] + ro : NULL, 1); g_shl_made++; dro[nd] = ro; drs[nd] = rs; nd++; }
     }
     g_stat_draws++;
 }
