@@ -4034,9 +4034,16 @@ static uint64_t hwl_now(void); static int hwl_since(uint64_t seq, uint64_t lo, u
 // earlier draws keep what they were recorded with). Pools nvn_dirty does not track, a copy still in flight, a reused pool slot (registration id) and memory pressure fall back
 // to the old copy. =2 also compares the window a draw can read with guest memory at each use (a difference is logged, and the draw copies as before)
 static int idxpool_keep_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_IDXPOOL_KEEP"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 1; if (v) LOG("vk: DM_VK_IDXPOOL_KEEP=%d: index pools of GPU-indirect indexed draws kept across frames, refreshed by written pages", v); } return v; }
-enum { IPK_NP = 8, IPK_NCMAX = 3 };
+enum { IPK_NPMAX = 16, IPK_NCMAX = 3 };
+// DM_VK_IDXPOOL_KEEP_SLOTS=N (hm-fix-2f; default 8, at most 16): pools kept at once. With all 8 slots busy (in flight) or taken, a GPU-indirect indexed draw copies its pool from its
+// start to the pool's end (at most 8 MB) into the ring: the extra-ring bursts at the outdoor load (640 MB at once, the zero-copy run's low-memory kill)
+static int ipk_np(void) { static int v; if (!v) { const char *e = getenv("DM_VK_IDXPOOL_KEEP_SLOTS"); v = e && atoi(e) > 0 ? atoi(e) : 8; if (v > IPK_NPMAX) v = IPK_NPMAX; } return v; }
+// The fallbacks by reason (cumulative; the memory watcher prints a second's worth when that second's fallback copies reach 32 MB): too big, pool not page-aligned, misaligned index
+// start, memory really low, untracked, refused pool, buffer not made; a slot's old pool in flight, no idle slot, no copy free; written since, write-back since; copies made and bytes
+enum { IPF_BIG, IPF_PGALIGN, IPF_ISZ, IPF_LOWMEM, IPF_UNTRACKED, IPF_REFUSED, IPF_ALLOC, IPF_SWAPFLIGHT, IPF_NOSLOT, IPF_NOCOPY, IPF_DIRTY, IPF_HWL, IPF_N };
+static _Atomic uint64_t g_ipf[IPF_N], g_ipf_copies, g_ipf_bytes;
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; uint64_t stamp, fence, hseq; int valid; } ipk_copy;   // hseq: the host write-back log at the sync (hwl)
-static struct { uint64_t base, size, regid, last; const void *span; ipk_copy c[IPK_NCMAX]; int cur; uint64_t cur_fence; int refused, hot; uint64_t refused_ns; } g_ipk[IPK_NP];   // hot: syncs in a row that copied over half the pool
+static struct { uint64_t base, size, regid, last; const void *span; ipk_copy c[IPK_NCMAX]; int cur; uint64_t cur_fence; int refused, hot; uint64_t refused_ns; } g_ipk[IPK_NPMAX];   // hot: syncs in a row that copied over half the pool
 static uint64_t g_ipk_late; static uint64_t g_ipk_hit, g_ipk_full, g_ipk_pages, g_ipk_syncs, g_ipk_fb_flight, g_ipk_fb_dirty, g_ipk_fb_other, g_ipk_bad, g_ipk_bytes_live, g_ipk_hwl_pages, g_ipk_fb_hwl;
 static int ipk_ncopies(void) { static int v; if (!v) { const char *e = getenv("DM_VK_IDXPOOL_KEEP_COPIES"); v = e && atoi(e) >= 1 ? atoi(e) : 2; if (v > IPK_NCMAX) v = IPK_NCMAX; } return v; }
 static void ipk_free_slot(int i) {   // every copy's fence done (the caller checked)
@@ -4087,40 +4094,40 @@ static int ipk_sync(int i, ipk_copy *c) {   // brings copy c of pool slot i up t
 }
 static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDeviceSize *o) {
     static uint64_t cap; if (!cap) { const char *e = getenv("DM_VK_IDXPOOL_ONCE_MB"); long mb = e && atol(e) > 0 ? atol(e) : 32; cap = (uint64_t)mb << 20; }
-    uint64_t psize = 0, base = pool_range(ibuf, &psize); if (!base || !n || psize > cap || ibuf + n > base + psize) { g_ipk_fb_other++; return 0; }
+    uint64_t psize = 0, base = pool_range(ibuf, &psize); if (!base || !n || psize > cap || ibuf + n > base + psize) { g_ipk_fb_other++; g_ipf[IPF_BIG]++; return 0; }
     static uint64_t pgm; if (!pgm) { long ps = sysconf(_SC_PAGESIZE); pgm = (uint64_t)(ps > 0 ? ps : 4096) - 1; }
-    if ((base & pgm) || (psize & pgm)) { g_ipk_fb_other++; return 0; }   // a host page shared with another range: its faults could stamp only the other one (grill-risk M4)
-    if ((ibuf - base) % isz) { g_ipk_fb_other++; return 0; }
-    if (g_mem_real_low) { for (int i = 0; i < IPK_NP; i++) if (g_ipk[i].base && ipk_idle(i)) ipk_free_slot(i); g_ipk_fb_other++; return 0; }   // real pressure: the kept copies go
+    if ((base & pgm) || (psize & pgm)) { g_ipk_fb_other++; g_ipf[IPF_PGALIGN]++; return 0; }   // a host page shared with another range: its faults could stamp only the other one (grill-risk M4)
+    if ((ibuf - base) % isz) { g_ipk_fb_other++; g_ipf[IPF_ISZ]++; return 0; }
+    if (g_mem_real_low) { for (int i = 0; i < ipk_np(); i++) if (g_ipk[i].base && ipk_idle(i)) ipk_free_slot(i); g_ipk_fb_other++; g_ipf[IPF_LOWMEM]++; return 0; }   // real pressure: the kept copies go
     const void *span = nvn_dirty_span((const void *)(uintptr_t)base, (size_t)psize); uint64_t rid = span ? nvn_dirty_span_regid(span) : 0;
-    if (!span || !rid) { g_ipk_fb_other++; return 0; }
-    int i = -1; for (int k = 0; k < IPK_NP; k++) if (g_ipk[k].base == base) { i = k; break; }
+    if (!span || !rid) { g_ipk_fb_other++; g_ipf[IPF_UNTRACKED]++; return 0; }
+    int i = -1; for (int k = 0; k < ipk_np(); k++) if (g_ipk[k].base == base) { i = k; break; }
     if (i >= 0 && (g_ipk[i].size != psize || g_ipk[i].regid != rid)) {   // another pool in that place: the old copies go once the GPU is done with them
-        if (!ipk_idle(i)) { g_ipk_fb_flight++; return 0; } ipk_free_slot(i); i = -1; }
-    if (i < 0) { for (int k = 0; k < IPK_NP && i < 0; k++) if (!g_ipk[k].base) i = k;
-        if (i < 0) { uint64_t old = UINT64_MAX; for (int k = 0; k < IPK_NP; k++) if (ipk_idle(k) && g_ipk[k].last < old) { old = g_ipk[k].last; i = k; }   // the least recently used idle pool
-                     if (i < 0) { g_ipk_fb_flight++; return 0; } ipk_free_slot(i); }
+        if (!ipk_idle(i)) { g_ipk_fb_flight++; g_ipf[IPF_SWAPFLIGHT]++; return 0; } ipk_free_slot(i); i = -1; }
+    if (i < 0) { for (int k = 0; k < ipk_np() && i < 0; k++) if (!g_ipk[k].base) i = k;
+        if (i < 0) { uint64_t old = UINT64_MAX; for (int k = 0; k < ipk_np(); k++) if (ipk_idle(k) && g_ipk[k].last < old) { old = g_ipk[k].last; i = k; }   // the least recently used idle pool
+                     if (i < 0) { g_ipk_fb_flight++; g_ipf[IPF_NOSLOT]++; return 0; } ipk_free_slot(i); }
         g_ipk[i].base = base; g_ipk[i].size = psize; g_ipk[i].regid = rid; }
     g_ipk[i].last = g_fence + 1;   // a refused pool in use keeps its slot (and its refusal) against eviction (re-check LOW)
     if (g_ipk[i].refused == 1 && now_ns() - g_ipk[i].refused_ns > 120000000000ull && ipk_idle(i)) { ipk_free_copies(i); g_ipk[i].refused = 0; g_ipk[i].hot = 0; }   // a hot pool: tried again (fresh copies) after 2 minutes, the game's use may have changed
-    if (g_ipk[i].refused) { if (ipk_idle(i)) ipk_free_copies(i); g_ipk_fb_other++; return 0; }   // grill-risk re-check MED: a refused pool's copies are freed once the GPU is done with them
+    if (g_ipk[i].refused) { if (ipk_idle(i)) ipk_free_copies(i); g_ipk_fb_other++; g_ipf[IPF_REFUSED]++; return 0; }   // grill-risk re-check MED: a refused pool's copies are freed once the GPU is done with them
     g_ipk[i].span = span; g_ipk[i].last = g_fence + 1;
     ipk_copy *c; int fresh = 0;
     if (g_ipk[i].cur_fence == g_fence + 1) {   // this submission's copy: any page this draw can read written since its stamp makes the draw copy as before
         c = &g_ipk[i].c[g_ipk[i].cur];
-        if (nvn_dirty_since_span(span, (const void *)(uintptr_t)ibuf, (size_t)n, c->stamp)) { g_ipk_fb_dirty++; return 0; }
-        if (hwl_since(c->hseq, ibuf, ibuf + n)) { g_ipk_fb_hwl++; return 0; }   // hm-fix-b
+        if (nvn_dirty_since_span(span, (const void *)(uintptr_t)ibuf, (size_t)n, c->stamp)) { g_ipk_fb_dirty++; g_ipf[IPF_DIRTY]++; return 0; }
+        if (hwl_since(c->hseq, ibuf, ibuf + n)) { g_ipk_fb_hwl++; g_ipf[IPF_HWL]++; return 0; }   // hm-fix-b
     } else {   // a copy the GPU no longer reads, the most recently synced first
         int best = -1; for (int k = 0; k < ipk_ncopies(); k++) { ipk_copy *x = &g_ipk[i].c[k]; if (x->b && x->fence > g_done) continue; if (best < 0 || (x->valid && (!g_ipk[i].c[best].valid || x->stamp > g_ipk[i].c[best].stamp))) best = k; }
-        if (best < 0) { g_ipk_fb_flight++; return 0; }
+        if (best < 0) { g_ipk_fb_flight++; g_ipf[IPF_NOCOPY]++; return 0; }
         c = &g_ipk[i].c[best];
-        if (!c->b) { c->b = buf_new(psize, ALL_BUF_USAGE, &c->m, (void **)&c->p); if (!c->b || !c->p) { g_ipk_fb_other++; return 0; } g_ipk_bytes_live += psize; c->valid = 0; }
+        if (!c->b) { c->b = buf_new(psize, ALL_BUF_USAGE, &c->m, (void **)&c->p); if (!c->b || !c->p) { g_ipk_fb_other++; g_ipf[IPF_ALLOC]++; return 0; } g_ipk_bytes_live += psize; c->valid = 0; }
         int sr = ipk_sync(i, c);
-        if (sr < 0) { g_ipk_fb_hwl++; return 0; }   // a write-back page could not be protected again: this draw copies as before
+        if (sr < 0) { g_ipk_fb_hwl++; g_ipf[IPF_HWL]++; return 0; }   // a write-back page could not be protected again: this draw copies as before
         if (!sr) { g_ipk[i].refused = 2; g_ipk_fb_other++; static int nl; if (nl++ < 4) LOG("vk: DM_VK_IDXPOOL_KEEP: pool %#llx +%llu cannot be protected: copied as before", (unsigned long long)base, (unsigned long long)psize); return 0; }
         c->fence = g_fence + 1; g_ipk[i].cur = best; g_ipk[i].cur_fence = g_fence + 1; fresh = 1;
-        if (hwl_since(c->hseq, ibuf, ibuf + n)) { g_ipk_fb_hwl++; return 0; }   // a write-back while it synced (hm-fix-b)
-        if (nvn_dirty_since_span(span, (const void *)(uintptr_t)ibuf, (size_t)n, c->stamp)) { g_ipk_fb_dirty++; return 0; }   // hm-fix-2 (the f2_k2 verify): a CPU write after the sync's stamp, as for a later draw
+        if (hwl_since(c->hseq, ibuf, ibuf + n)) { g_ipk_fb_hwl++; g_ipf[IPF_HWL]++; return 0; }   // a write-back while it synced (hm-fix-b)
+        if (nvn_dirty_since_span(span, (const void *)(uintptr_t)ibuf, (size_t)n, c->stamp)) { g_ipk_fb_dirty++; g_ipf[IPF_DIRTY]++; return 0; }   // hm-fix-2 (the f2_k2 verify): a CPU write after the sync's stamp, as for a later draw
     }
     // =2 (hm-fix-all): the whole pool compared once, right after a sync (about 3.5 pools of ~8 MB a frame outdoors); later draws of the submission rely on the dirty and
     // write-back checks above. =3: every draw's window compared (the old =2: ~60% of the recording thread outdoors, 11-11 profile)
@@ -4487,7 +4494,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             if (n && tog(TG_BSTORE) && ts_buf(di->ibuf, n, 16, TSK_IDXPOOL, &ibs, &o)) {}   // DM_VK_BUF_STORE (vk19.72): the store's block
             else if (n && idxpool_keep_mode() && ipk_get(di->ibuf, n, isz, &ibs, &o)) {}   // DM_VK_IDXPOOL_KEEP: the pool's kept copy
             else if (n && idxpool_once_mode() && ipo_get(di->ibuf, n, isz, &ibs, &o)) {}   // DM_VK_IDXPOOL_ONCE: the submission's one copy of the pool
-            else { o = n ? copy_in(di->ibuf, n, 16, CI_IDXPOOL) : VK_WHOLE_SIZE; ibs = C->ring; if (h0slot >= 0 && o != VK_WHOLE_SIZE) C->h0ipp[h0slot] = C->ringp + o; }
+            else { o = n ? copy_in(di->ibuf, n, 16, CI_IDXPOOL) : VK_WHOLE_SIZE; ibs = C->ring; if (n) { g_ipf_copies++; g_ipf_bytes += n; } if (h0slot >= 0 && o != VK_WHOLE_SIZE) C->h0ipp[h0slot] = C->ringp + o; }
             if (o == VK_WHOLE_SIZE) { RED_ONCE(38, "a GPU-written indirect indexed draw: its index buffer is not in a known pool"); return; }
             if (h0slot >= 0) { C->h0iw[h0slot] = (uint32_t)n; C->h0isz[h0slot] = (uint8_t)isz; }
             g_ds_last.ib_ok = 0; vkCmdBindIndexBuffer(cb, ibs, o, isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
@@ -4864,6 +4871,13 @@ static void mem_watch(void) {
               LOG("[mem] last second: texture uploads %.0f MB of storage, %.0f MB through the rings, %llu textures made; re-uploads held %llu, levels left out %llu; extra rings made %llu, at most %.0f MB at once",
                   (up - pup) / 1048576.0, (rg - pring) / 1048576.0, (unsigned long long)(tm - ptm), (unsigned long long)(held - pheld), (unsigned long long)(skip - pskip), (unsigned long long)(xn - pxn), pk / 1048576.0);
           pup = up; ptm = tm; pring = rg; pheld = held; pskip = skip; pxn = xn; }
+        { static uint64_t pb, pc, pr[IPF_N]; uint64_t b = atomic_load(&g_ipf_bytes), c = atomic_load(&g_ipf_copies);   // hm-fix-2f: the index-pool fallback copies of a heavy second, by reason
+          if (hbase >= 0 && b - pb >= (32ull << 20) && nline++ < 300) {
+              static const char *nm[IPF_N] = {"too big", "pool not page-aligned", "index start misaligned", "memory really low", "untracked", "refused pool", "no buffer", "the slot's old pool in flight", "no idle slot", "no free copy", "written since the copy", "a write-back since"};
+              char t[512]; int k = 0; for (int r = 0; r < IPF_N && k < (int)sizeof t - 64; r++) { uint64_t v = atomic_load(&g_ipf[r]); if (v != pr[r]) k += snprintf(t + k, sizeof t - k, "%s %s %llu", k ? "," : "", nm[r], (unsigned long long)(v - pr[r])); }
+              LOG("[mem] last second: GPU-indirect index pools copied into the ring %llu times, %.0f MB (DM_VK_IDXPOOL_KEEP %d, %d slots); why the kept copy was not used:%s",
+                  (unsigned long long)(c - pc), (b - pb) / 1048576.0, idxpool_keep_mode(), ipk_np(), k ? t : " (not asked)"); }
+          pb = b; pc = c; for (int r = 0; r < IPF_N; r++) pr[r] = atomic_load(&g_ipf[r]); }
         hbase = hu; bbase = dm_ue_heap_big(); prss = rss; pavail = avail; pdrv = drv;
     }
     int is_low = low > 0 && avail > 0 && avail / 1024 < low, over = budget > 0 && ours > budget;
