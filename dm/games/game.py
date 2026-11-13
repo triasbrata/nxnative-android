@@ -132,6 +132,8 @@ def header(g):
     if uha != 'pool' and (not uha.isdigit() or not 32 <= int(uha) <= 8193): sys.exit(f'{g.id}: ubo_handle_array must be pool or a number from 32 to 8193: {uha}')
     spb = g.get('spare_block', 'off')   # Android: an empty 64 MB image block kept ready, made off the recording thread (nvn_vk.c DM_VK_SPARE_BLOCK overrides): on / off
     if spb not in ('on', 'off'): sys.exit(f'{g.id}: spare_block must be on or off: {spb}')
+    vkp = g.get('vk_pool', 'off')   # Android: shaders that index the game's texture / sampler pools by ID (tex_pool / samp_pool) read one shared descriptor set (nvn_vk.c pool_on, DM_VK_POOL overrides): on / off
+    if vkp not in ('on', 'off'): sys.exit(f'{g.id}: vk_pool must be on or off: {vkp}')
     tds = g.get('tex_dyn_slots', 'off')   # shaders whose texture handle the translator could not trace to one slot: slot indices in c2, the bound slots in the fallback arrays (nvn_mtl.m): on / off
     if tds not in ('on', 'off'): sys.exit(f'{g.id}: tex_dyn_slots must be on or off: {tds}')
     vcr = g.get('vconv_range', 'off')   # vertex attributes converted on the CPU only over the vertices each draw reads (nvn_mtl.m vc_draw_range): on / off
@@ -197,6 +199,7 @@ def header(g):
          f'#define DM_GAME_TEX_DIRTY_UPLOAD {int(tdu == "on")}',
          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
          f'#define DM_GAME_SPARE_BLOCK {int(spb == "on")}',
+         f'#define DM_GAME_VK_POOL {int(vkp == "on")}',
          f'#define DM_GAME_GPU_TS_SEGMENT {int(gts == "segment")}',
          f'#define DM_GAME_VCONV_RANGE {int(vcr == "on")}',
          f'#define DM_GAME_RANGE_STORE_TEXEL {int("texel" in rs)}',

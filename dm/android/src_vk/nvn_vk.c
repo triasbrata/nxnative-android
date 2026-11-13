@@ -188,6 +188,14 @@ static int spare_hold(void) { uint64_t t = atomic_load(&g_last_trim_ns); return 
 #define DM_GAME_SPARE_BLOCK 0
 #endif
 static int spare_block_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SPARE_BLOCK"); v = e ? atoi(e) != 0 : DM_GAME_SPARE_BLOCK; LOG("vk: DM_VK_SPARE_BLOCK=%d: %s", v, v ? "an empty image block kept ready (made off the recording thread)" : "image blocks made when needed, freed when empty"); } return v; }
+#ifndef DM_GAME_VK_POOL
+#define DM_GAME_VK_POOL 0
+#endif
+// Profile key vk_pool (DM_VK_POOL=0/1 overrides): a shader whose texture handle the translator traced to no slot (kinds tex_pool / samp_pool) indexes the game's texture and
+// sampler pools by ID; its pools go to the pool set (pool_shader / pool_set). Off: such pools are left as an unknown kind, as before (logged; the shader draws wrong)
+static int pool_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_POOL"); v = e ? atoi(e) != 0 : DM_GAME_VK_POOL; if (v) LOG("vk: DM_VK_POOL=1: shaders indexing the texture and sampler pools by ID read the pool set"); } return v; }
+// The pool set's texture arrays: IDs per class (DM_VK_POOL_CAP, at least 1024; the texture pool's capacity mtl_set_tex_pool_n reports above it is logged)
+static uint32_t pool_cap(void) { static uint32_t c; if (!c) { const char *e = getenv("DM_VK_POOL_CAP"); c = e && atoi(e) >= 1024 ? (uint32_t)atoi(e) : 65536; } return c; }
 static int blk_empty(const mblock *b) { return b->m && !b->live; }
 static int img_mem_(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off) {
     uint32_t type = mem_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1042,6 +1050,7 @@ static void *completion_thread(void *a) { pthread_setname_np("dm-complete");
 
 // ---------- Device ----------
 static int g_has_u8;
+static int g_pool_dev;   // the GPU can hold the pool set: partially bound, update-after-bind sampled images, non-uniform indexing (vk_pool)
 static VkPhysicalDeviceFeatures g_feat;   // what the GPU has (every one of them is enabled at device creation): dualSrcBlend, wideLines, textureCompressionBC
 static VkSampler g_dummy_samp; static VkImage g_dummy_img; static VkImageView g_dummy_view; static VkBuffer g_zero_buf, g_support_buf; static VkDeviceMemory g_zero_mem, g_support_mem;
 // Stand-ins for a binding nothing real is bound to: a texel buffer of zeros (uniform), one for shader writes (storage, a scratch buffer of its own so the zeros stay zero), a storage image
@@ -1151,6 +1160,8 @@ static void vk_init_(void) {
     vkGetPhysicalDeviceFeatures2(g_pd, &f2);
     f13.robustImageAccess = VK_FALSE;
     g_feat = f2.features;
+    g_pool_dev = dv >= VK_API_VERSION_1_2 && f12.descriptorBindingPartiallyBound && f12.descriptorBindingSampledImageUpdateAfterBind && f12.descriptorBindingUpdateUnusedWhilePending &&
+                 f12.shaderSampledImageArrayNonUniformIndexing && g_feat.shaderSampledImageArrayDynamicIndexing;   // the pool set's needs (pool_dsl); every feature the GPU has is enabled anyway
     const char *ext[8]; uint32_t next = 0;
     if (g_has_budget) ext[next++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
     if (has_sc && g_has_surface) ext[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
@@ -1456,6 +1467,7 @@ struct vtex {
     int copied;   // a GPU copy (copy_b2t) or a shader's image store wrote into it: hibernation reads it back before a snapshot even when it was uploaded first
     uint8_t late;   // made before the game wrote its storage, watched for that (late_fill)
     uint32_t mir_lv;   // levels a GPU copy wrote whose bytes were written into the storage too (copy_b2t / copy_t2t mirror): the storage holds them, as the image does
+    int inpool; uint64_t pool_out;   // entries of the pool set holding a view of it (vk_pool: never evicted, not freed while held); the submission after which the last one let go
     uint32_t linrow, linbpb;   // a linear 2D texture (LINEAR / LINEAR_RENDER_TARGET) the CPU can read: its row pitch and bytes per texel; what passes render into it goes back to its storage (lin_writeback)
 };
 static vtex **g_gb; static int g_ngb, g_cgb; static pthread_mutex_t g_gbmu = PTHREAD_MUTEX_INITIALIZER;
@@ -1698,6 +1710,14 @@ static int tex_remake(vtex *v, const tex_t *t) {
 }
 static uint64_t g_trim_gen_tex;
 static _Atomic uint64_t g_reg_gen;   // any texture or sampler registration, or a texture release (the stage-level set reuse, DM_VK_STAGE_REUSE)
+// What the pool set (vk_pool) must look at again: the IDs registered since its last sync (a bitmap, under g_rmu), textures released or written by the CPU while it held them,
+// sampler registrations; g_pool_live once it exists
+static uint64_t *g_pool_dbits; static int g_pool_ndw; static int g_pool_live;
+static _Atomic uint64_t g_pool_kill, g_pool_cpu, g_pool_sgen; static _Atomic int g_tpool_n;
+static void pool_mark(int id) {   // caller holds g_rmu
+    int w = id >> 6; if (w >= g_pool_ndw) { int n = w + 64; g_pool_dbits = realloc(g_pool_dbits, n * sizeof *g_pool_dbits); memset(g_pool_dbits + g_pool_ndw, 0, (n - g_pool_ndw) * sizeof *g_pool_dbits); g_pool_ndw = n; }
+    g_pool_dbits[w] |= 1ull << (id & 63);
+}
 // The age a trim evicts at: 60 frames, and DM_VK_EVICT_FAST (default 30) on an early trim for fast heap growth (mem_watch). FINAL FANTASY RESONANCE's battles load about 300 MB
 // of the game heap at the transition, while the field's textures sit unused behind the battle
 static _Atomic int g_trim_age = 60;
@@ -1713,7 +1733,7 @@ static void tex_evict(uint64_t trim_gen) {
     int nev = 0;
     lk_(&g_rmu, LW_RMU);
     for (int hh = 0; hh < NHASH; hh++) for (vtex *v = g_tex[hh]; v; v = v->next) {
-        if (v->dead || v->evicted || !v->packaged || v->gpu || (v->gpu_lv & ~v->mir_lv) || v->dirty || !v->img || v->last_fence > done || n - v->last_frame < age) continue;   // levels GPU copies wrote count when their bytes were mirrored into the storage (mir_lv)
+        if (v->dead || v->evicted || v->inpool || !v->packaged || v->gpu || (v->gpu_lv & ~v->mir_lv) || v->dirty || !v->img || v->last_fence > done || n - v->last_frame < age) continue;   // levels GPU copies wrote count when their bytes were mirrored into the storage (mir_lv)
         for (int k = 0; k < v->nviews; k++) vkDestroyImageView(g_dev, v->views[k].v, NULL);
         free(v->views); v->views = NULL; v->nviews = 0;
         vkDestroyImage(g_dev, v->img, NULL); img_mem_free(v->blk, v->m, v->moff, v->msize); v->img = VK_NULL_HANDLE; v->evicted = 1; nev++;
@@ -1800,6 +1820,7 @@ static void tex_free(vtex *v) {   // released by the game: draws already recorde
     atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_relaxed);
     pthread_mutex_lock(&g_gbmu);
     v->dead = g_fence + 1;
+    if (__atomic_load_n(&v->inpool, __ATOMIC_ACQUIRE)) atomic_fetch_add(&g_pool_kill, 1);   // the pool set lets go of it at its next sync
     if (g_ngb == g_cgb) { g_cgb = g_cgb ? 2 * g_cgb : 64; g_gb = realloc(g_gb, g_cgb * sizeof *g_gb); }
     g_gb[g_ngb++] = v;
     pthread_mutex_unlock(&g_gbmu);
@@ -1808,7 +1829,7 @@ static void garbage_free(uint64_t done) {
     pthread_mutex_lock(&g_gbmu);
     for (int i = 0; i < g_ngb;) {
         vtex *v = g_gb[i];
-        if (v->dead > done) { i++; continue; }
+        if (v->dead > done || __atomic_load_n(&v->inpool, __ATOMIC_ACQUIRE) || __atomic_load_n(&v->pool_out, __ATOMIC_ACQUIRE) > done) { i++; continue; }   // the pool set may still hold its view (vk_pool)
         lk_(&g_rmu, LW_RMU);   // out of the table now (mtl_tex_release left it there)
         for (vtex **pp = &g_tex[v->serial % NHASH]; *pp; pp = &(*pp)->next) if (*pp == v) { *pp = v->next; break; }
         pthread_mutex_unlock(&g_rmu);
@@ -1894,6 +1915,7 @@ void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     lk_(&g_rmu, LW_RMU);
     if (id >= g_ntreg) { int n = id + 1024; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     g_treg[id].t = *t; g_treg[id].ok = 1; g_treg[id].has_v = v != NULL; if (v) g_treg[id].v = *v; atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_relaxed);
+    if (g_pool_live) pool_mark(id);   // the pool set resolves this ID again at its next sync
     int dead = t->magic != MAGIC('T', 'E', 'X', 0); if (dead) g_treg_dead++;   // kept as the game registered it; tex_get never makes an image of it (the slot reads the black stand-in, as on the Metal host)
     pthread_mutex_unlock(&g_rmu);
     if (dead) { static int n; if (n++ < 4) { const uint64_t *q = (const uint64_t *)t; LOG("vk: texture ID %d registered with an object that is not a texture (finalized or reused memory; starts %016llx %016llx): its slot reads black, as on the Metal host",
@@ -1903,10 +1925,10 @@ void mtl_reg_samp(int id, const samp_par *p) {
     if (id < 0) return;
     lk_(&g_rmu, LW_RMU);
     if (id >= g_nsreg) { int n = id + 256; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, n); memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg); g_nsreg = n; }
-    g_sreg[id] = *p; g_sreg_ok[id] = 1; atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_relaxed);
+    g_sreg[id] = *p; g_sreg_ok[id] = 1; atomic_fetch_add_explicit(&g_reg_gen, 1, memory_order_relaxed); atomic_fetch_add(&g_pool_sgen, 1);
     pthread_mutex_unlock(&g_rmu);
 }
-void mtl_set_tex_pool_n(int n) { (void)n; }
+void mtl_set_tex_pool_n(int n) { atomic_store(&g_tpool_n, n); }   // the texture pools' capacity (host IDs): the pool set logs it when it is over pool_cap
 void mtl_tex_init(const tex_t *t) { (void)t; }
 // Released by the game (TextureFinalize): it stays findable by its serial until it is freed (garbage_free), as commands recorded before the release and replayed after it -- an
 // Unreal mip-streaming copy out of the texture being replaced -- still name it. Taken out of the table at once, such a copy found no image, made a new one from the texture's
@@ -1920,6 +1942,7 @@ void mtl_tex_release(tex_t *t) {
 void mtl_tex_cpu_written(const tex_t *t) {
     lk_(&g_rmu, LW_RMU);
     vtex *v = tex_find(t->serial); if (v) v->dirty = 1;
+    if (v && v->inpool) atomic_fetch_add(&g_pool_cpu, 1);   // the pool set uploads it again at its next sync
     if (!cpu_written(t->serial)) { if (g_ncpu == g_ccpu) { g_ccpu = g_ccpu ? 2 * g_ccpu : 64; g_cpu_written = realloc(g_cpu_written, g_ccpu * sizeof *g_cpu_written); } g_cpu_written[g_ncpu++] = t->serial; }
     pthread_mutex_unlock(&g_rmu);
 }
@@ -1955,7 +1978,7 @@ static VkSampler samp_get(int sid) {
 
 // ---------- Shaders and pipelines ----------
 enum { BT_UBO, BT_SSBO, BT_CIS, BT_TBUF, BT_UTB, BT_STB, BT_SIMG, BT_TEX, BT_SAMP };
-enum { K_UNK, K_CBUF, K_C1, K_SUPPORT, K_DRVCB, K_TEX, K_IMG, K_SBUF, K_TBUF, K_UBOP, K_TEXU };   // K_UBOP: a compute uniform buffer read through its address (dmsh_build.py ubo_ptr), bound as storage;
+enum { K_UNK, K_CBUF, K_C1, K_SUPPORT, K_DRVCB, K_TEX, K_IMG, K_SBUF, K_TBUF, K_UBOP, K_TEXU, K_TPOOL, K_SPOOL };   // K_TPOOL / K_SPOOL: the texture / sampler pool indexed by ID (vk_pool)   // K_UBOP: a compute uniform buffer read through its address (dmsh_build.py ubo_ptr), bound as storage;
                                                                                                 // K_TEXU: a bindless texture handle in uniform slot reg at byte off (tex_ubo)
 enum { S_NONE, S_SAMP, S_SAMP_TEX, S_SAMP_ID, S_SAMP_UBO };   // S_SAMP_UBO: the sampler's handle in uniform slot sreg at byte soff (samp_ubo)
 // off / soff: byte offsets in a uniform buffer, up to its 64 KB -- 32-bit (vk-t11): as int16_t, Tomodachi Life's island composite read its handles at cbuf 0 + 40928..40952 as
@@ -1978,6 +2001,7 @@ typedef struct {
     uint16_t in_type[32];   // a pixel shader's input type per location (spv_io: 1-4 components | 0x100 int | 0x200 uint; 0 = not a plain 32-bit scalar or vector)
     struct { uint32_t mask; VkShaderModule m; } pad[8]; int npad, pad_full;   // a vertex shader's padded variants, by the locations added (vs_pad_mod)
     int io_complex;   // a user interface variable that is not a scalar or vector (an array, matrix or struct takes several locations): never padded
+    int pool;   // its texture / sampler pools were moved into the pool set (pool_shader): its layout has set SPV_POOL_SET, draws bind pool_set() there
 } shader_t;
 static shader_t **g_sh; static int g_nsh;
 static int g_depth_zero;   // NVN depth mode (mtl_set_depth_zero, defined with the replay state)
@@ -2359,6 +2383,65 @@ static uint32_t *vs_transform(shader_t *s, uint32_t *spv, size_t *nsp, int at_lo
     spv_set(spv, ns / 4, s->stage == 1 ? 1 : s->stage == 2 ? 2 : 0);   // fragment resources in set 1, geometry in set 2
     *nsp = ns; return spv;
 }
+// ---------- Pool set (vk_pool) ----------
+// A shader whose texture handle the translator traced to no slot indexes the game's texture pool by the handle's texture ID and the sampler pool by its sampler ID (dmsh_build.py
+// pool_arrays; the Metal host serves it from pool_gpu). Here those arrays live in one descriptor set shared by every such shader, set SPV_POOL_SET of its layout: a binding per
+// texture class (2D, 2D array, 3D, cube; the shader declares the class, spv_pool.h) of pool_cap() entries, entry k = the view of host texture ID tex_base + k when its class is
+// the binding's (else that class's black stand-in), and the samplers. One set for the game (the GPU allows 7 bound sets; Tomodachi Life's ground and 188 more of its pixel
+// shaders read pools), kept up to date entry by entry (pool_set): the IDs registered since the last sync, the textures released or CPU-written while it held them, the samplers.
+// Entries are written while earlier submissions may be pending (UPDATE_AFTER_BIND, UPDATE_UNUSED_WHILE_PENDING; PARTIALLY_BOUND): as on the Switch, a draw reads what the pool
+// holds when it runs. A texture the set holds is never evicted and not freed until the set let go of it and the GPU passed that submission (vtex inpool / pool_out)
+#include "spv_pool.h"
+static VkDescriptorSetLayout g_pool_dsl_; static int g_pool_dsl_tried;
+static int g_pool_shaders, g_pool_refused;
+static VkDescriptorSetLayout pool_dsl(void) {   // made at the first pool shader (shader_get_, under g_shmu); VK_NULL_HANDLE when the GPU cannot hold it
+    if (g_pool_dsl_ || g_pool_dsl_tried) return g_pool_dsl_;
+    g_pool_dsl_tried = 1;
+    VkPhysicalDeviceVulkan12Properties p12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES}; VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
+    vkGetPhysicalDeviceProperties2(g_pd, &p2);
+    uint32_t cap = pool_cap(), need = SPV_PC_N * cap;
+    LOG("vk: pool set: %u texture IDs in each of %d classes, %d samplers; the GPU allows (update after bind) sampled images %u per stage / %u per set, samplers %u / %u, %u in all pools; %u bound sets",
+        cap, SPV_PC_N, SPV_POOL_SAMP_CAP, p12.maxPerStageDescriptorUpdateAfterBindSampledImages, p12.maxDescriptorSetUpdateAfterBindSampledImages, p12.maxPerStageDescriptorUpdateAfterBindSamplers,
+        p12.maxDescriptorSetUpdateAfterBindSamplers, p12.maxUpdateAfterBindDescriptorsInAllPools, g_props.limits.maxBoundDescriptorSets);
+    if (p12.maxPerStageDescriptorUpdateAfterBindSampledImages < need || p12.maxDescriptorSetUpdateAfterBindSampledImages < need || p12.maxPerStageDescriptorUpdateAfterBindSamplers < SPV_POOL_SAMP_CAP ||
+        p12.maxDescriptorSetUpdateAfterBindSamplers < SPV_POOL_SAMP_CAP || p12.maxUpdateAfterBindDescriptorsInAllPools < need + SPV_POOL_SAMP_CAP || g_props.limits.maxBoundDescriptorSets < SPV_POOL_SET + 1) {
+        LOG("[RED] vk: pool set: over the GPU's limits: shaders indexing the pools stay as before (their pools unbound)"); return VK_NULL_HANDLE; }
+    VkDescriptorSetLayoutBinding lb[SPV_PC_N + 1]; VkDescriptorBindingFlags bf[SPV_PC_N + 1];
+    for (int c = 0; c <= SPV_PC_N; c++) {
+        lb[c] = (VkDescriptorSetLayoutBinding){(uint32_t)c, c == SPV_POOL_SAMP ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, c == SPV_POOL_SAMP ? SPV_POOL_SAMP_CAP : cap, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        bf[c] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+    }
+    VkDescriptorSetLayoutBindingFlagsCreateInfo fi = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, NULL, SPV_PC_N + 1, bf};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &fi, VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT, SPV_PC_N + 1, lb};
+    VkResult r = vkCreateDescriptorSetLayout(g_dev, &li, NULL, &g_pool_dsl_);
+    if (r != VK_SUCCESS) { LOG("[RED] vk: pool set layout failed (%d): shaders indexing the pools stay as before", (int)r); g_pool_dsl_ = VK_NULL_HANDLE; }
+    return g_pool_dsl_;
+}
+// At load (shader_get_): a shader's pool bindings move into the pool set (spv_pool_patch) and out of its own set; anything in the way leaves them as an unknown kind, as before
+static uint32_t *pool_shader(shader_t *s, uint32_t *spv, size_t *ns) {
+    spv_pool_var pv[16]; int np = 0;
+    for (int i = 0; i < s->nb; i++) if (s->b[i].kind == K_TPOOL || s->b[i].kind == K_SPOOL) { if (np < 16) { pv[np].binding = s->b[i].binding; pv[np].samp = s->b[i].kind == K_SPOOL; } np++; }
+    if (!np || !spv) return spv;
+    const char *why = NULL; uint32_t *o = NULL; size_t nw = *ns / 4;
+    if (!g_pool_dev) why = "the GPU lacks partially bound / update-after-bind sampled images or their non-uniform indexing";
+    else if (s->stage != 1) why = "not a pixel shader (the pool set is the pixel stage's)";
+    else if (np > 16) why = "more than 16 pools";
+    else if (!pool_dsl()) why = "no pool set (over the GPU's limits)";
+    else if (!(o = spv_pool_patch(spv, &nw, pv, np, pool_cap()))) why = spv_pool_err;
+    if (why) {
+        for (int i = 0; i < s->nb; i++) if (s->b[i].kind == K_TPOOL || s->b[i].kind == K_SPOOL) s->b[i].kind = K_UNK;
+        if (g_pool_refused++ < 16) LOG("[RED] vk: shader %s: its texture / sampler pools stay unbound (%s)", s->key, why);
+        return spv;
+    }
+    int j = 0; for (int i = 0; i < s->nb; i++) if (s->b[i].kind != K_TPOOL && s->b[i].kind != K_SPOOL) s->b[j++] = s->b[i];
+    s->nb = j; s->pool = 1;
+    if (g_pool_shaders++ < 8) {
+        static const char *const cn[] = {"2D", "2D array", "3D", "cube"}; char b[128]; int bo = 0;
+        for (int i = 0; i < np && bo < 100; i++) bo += snprintf(b + bo, sizeof b - bo, "%s%s", i ? ", " : "", pv[i].samp ? "samplers" : cn[pv[i].cls]);
+        LOG("vk: shader %s: its pools (%s) read the pool set (vk_pool; such shaders read zero before)", s->key, b);
+    }
+    free(spv); *ns = nw * 4; return o;
+}
 static shader_t *shader_get_(const uint8_t md[8]);
 static shader_t *shader_get(const uint8_t md[8]) {
     pthread_mutex_lock(&g_shmu);
@@ -2387,7 +2470,8 @@ static shader_t *shader_get_(const uint8_t md[8]) {
             e->type = !strcmp(ty, "ubo") ? BT_UBO : !strcmp(ty, "ssbo") ? BT_SSBO : !strcmp(ty, "cis") ? BT_CIS : !strcmp(ty, "tbuf") ? BT_TBUF : !strcmp(ty, "utb") ? BT_UTB :
                       !strcmp(ty, "stb") ? BT_STB : !strcmp(ty, "simg") ? BT_SIMG : !strcmp(ty, "tex") ? BT_TEX : BT_SAMP;
             e->kind = !strcmp(kind, "cbuf") ? K_CBUF : !strcmp(kind, "c1") ? K_C1 : !strcmp(kind, "support") ? K_SUPPORT : !strcmp(kind, "drvcb") ? K_DRVCB : !strcmp(kind, "tex") ? K_TEX :
-                      !strcmp(kind, "img") ? K_IMG : !strcmp(kind, "sbuf") ? K_SBUF : !strcmp(kind, "tbuf") ? K_TBUF : !strcmp(kind, "ubo_ptr") ? K_UBOP : !strcmp(kind, "tex_ubo") ? K_TEXU : K_UNK;
+                      !strcmp(kind, "img") ? K_IMG : !strcmp(kind, "sbuf") ? K_SBUF : !strcmp(kind, "tbuf") ? K_TBUF : !strcmp(kind, "ubo_ptr") ? K_UBOP : !strcmp(kind, "tex_ubo") ? K_TEXU :
+                      pool_on() && !strcmp(kind, "tex_pool") ? K_TPOOL : pool_on() && !strcmp(kind, "samp_pool") ? K_SPOOL : K_UNK;
             e->skind = !strcmp(sk, "samp") ? S_SAMP : !strcmp(sk, "samp_tex") ? S_SAMP_TEX : !strcmp(sk, "samp_id") ? S_SAMP_ID : !strcmp(sk, "samp_ubo") ? S_SAMP_UBO : S_NONE;
 #ifndef DM_GAME_TEX_DYN_SLOTS
 #define DM_GAME_TEX_DYN_SLOTS 0
@@ -2399,6 +2483,7 @@ static shader_t *shader_get_(const uint8_t md[8]) {
         }
     }
     free(txt);
+    if (pool_on()) spv = pool_shader(s, spv, &ns);   // tex_pool / samp_pool: into the pool set, or back to the unknown kind
     s->ssbo_wr = spv_ssbo_writes(spv, ns / 4);
     for (size_t i = 5; i + 4 < ns / 4;) { uint32_t op = spv[i] & 0xffff, n = spv[i] >> 16; if (!n) break;   // BuiltIn Layer (9): OpDecorate / OpMemberDecorate
         if ((op == 71 && n >= 4 && spv[i + 2] == 11 && spv[i + 3] == 9) || (op == 72 && n >= 5 && spv[i + 3] == 11 && spv[i + 4] == 9)) s->layer_out = 1;
@@ -2438,9 +2523,9 @@ static VkPipelineLayout layout_get(shader_t *vs, shader_t *fs, shader_t *gs) {  
 static VkPipelineLayout layout_get_(shader_t *vs, shader_t *fs, shader_t *gs) {
     for (int i = 0; i < g_npl; i++) if (g_pl[i].vs == vs && g_pl[i].fs == fs && g_pl[i].gs == gs) return g_pl[i].pl;
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; VKCHECK(vkCreateDescriptorSetLayout(g_dev, &li, NULL, &g_empty_dsl)); }
-    VkDescriptorSetLayout sl[3] = {vs ? vs->dsl : g_empty_dsl, fs ? fs->dsl : g_empty_dsl, gs ? gs->dsl : g_empty_dsl};
+    VkDescriptorSetLayout sl[4] = {vs ? vs->dsl : g_empty_dsl, fs ? fs->dsl : g_empty_dsl, gs ? gs->dsl : g_empty_dsl, fs && fs->pool ? pool_dsl() : VK_NULL_HANDLE};   // set 3: the pool set
     VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT, 0, 4};   // a vertex shader reading VertexIndex: the shift draw() made (spv_vid_bias)
-    VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, gs ? 3 : fs ? 2 : 1, sl, vs && vs->vid ? 1 : 0, vs && vs->vid ? &pr : NULL};
+    VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, fs && fs->pool ? 4 : gs ? 3 : fs ? 2 : 1, sl, vs && vs->vid ? 1 : 0, vs && vs->vid ? &pr : NULL};
     VkPipelineLayout pl; VKCHECK(vkCreatePipelineLayout(g_dev, &pi, NULL, &pl));
     g_pl = realloc(g_pl, (g_npl + 1) * sizeof *g_pl); g_pl[g_npl++] = (prog_vk){vs, fs, gs, pl};
     return pl;
@@ -3847,6 +3932,153 @@ static int dyn_resolve(shader_t *s, int stage, int i, VkBuffer *buf, VkDeviceSiz
     }
     return 0;
 }
+// The pool set itself (see pool_dsl): made at the first draw of a pool shader, filled with the classes' stand-ins, then kept up to date by pool_set at each such draw
+static VkDescriptorPool g_pool_dp; static VkDescriptorSet g_pool_ds; static VkImageView g_pool_dummy[SPV_PC_N];
+static struct { VkImageView *view[SPV_PC_N]; vtex **v; VkSampler *samp; int tb, sb, synced; uint64_t reg, kill, cpu, sgen; } g_ps;
+static VkWriteDescriptorSet *g_pw; static VkDescriptorImageInfo *g_pwi; static int g_pnw, g_pcw;   // the writes of one sync
+static uint64_t g_pool_syncs, g_pool_fast, g_pool_writes, g_pool_ns, g_pool_made;
+static VkImageView pool_dummy_img(VkImageViewType vt, VkImageType it, uint32_t layers, VkImageCreateFlags fl) {   // a black 1x1 stand-in of a class
+    VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, fl, it, VK_FORMAT_R8G8B8A8_UNORM, {1, 1, 1}, 1, layers, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img; VKCHECK(vkCreateImage(g_dev, &ii, NULL, &img));
+    VkMemoryRequirements r; vkGetImageMemoryRequirements(g_dev, img, &r); VkDeviceMemory m = mem_alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); VKCHECK(vkBindImageMemory(g_dev, img, m, 0));
+    VkCommandBuffer cb = once_begin(); to_general(cb, img, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}; vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &rr); once_end(cb);
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img, vt, VK_FORMAT_R8G8B8A8_UNORM, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}};
+    VkImageView v; VKCHECK(vkCreateImageView(g_dev, &vi, NULL, &v)); return v;
+}
+static void pool_write(int binding, uint32_t elem, VkImageView view, VkSampler sm) {
+    if (g_pnw == g_pcw) { g_pcw = g_pcw ? 2 * g_pcw : 1024; g_pw = realloc(g_pw, g_pcw * sizeof *g_pw); g_pwi = realloc(g_pwi, g_pcw * sizeof *g_pwi); }
+    g_pwi[g_pnw] = (VkDescriptorImageInfo){sm, view, VK_IMAGE_LAYOUT_GENERAL};
+    g_pw[g_pnw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_pool_ds, (uint32_t)binding, elem, 1, sm ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE};
+}
+static void pool_flush(void) {
+    for (int i = 0; i < g_pnw; i++) g_pw[i].pImageInfo = &g_pwi[i];   // the info array may have moved while it grew
+    if (g_pnw) vkUpdateDescriptorSets(g_dev, (uint32_t)g_pnw, g_pw, 0, NULL);
+    g_pool_writes += (uint64_t)g_pnw; g_pnw = 0;
+}
+static int pool_init(void) {
+    static int tried; if (tried) return g_pool_ds != VK_NULL_HANDLE; tried = 1;
+    if (!pool_dsl()) return 0;
+    uint32_t cap = pool_cap();
+    g_pool_dummy[SPV_PC_2D] = g_dummy_view;
+    g_pool_dummy[SPV_PC_2DA] = pool_dummy_img(VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_TYPE_2D, 1, 0);
+    g_pool_dummy[SPV_PC_3D] = pool_dummy_img(VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_TYPE_3D, 1, 0);
+    g_pool_dummy[SPV_PC_CUBE] = pool_dummy_img(VK_IMAGE_VIEW_TYPE_CUBE, VK_IMAGE_TYPE_2D, 6, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, SPV_PC_N * cap}, {VK_DESCRIPTOR_TYPE_SAMPLER, SPV_POOL_SAMP_CAP}};
+    VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT, 1, 2, ps};
+    VkResult r = vkCreateDescriptorPool(g_dev, &pi, NULL, &g_pool_dp);
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_pool_dp, 1, &g_pool_dsl_};
+    if (r == VK_SUCCESS) r = vkAllocateDescriptorSets(g_dev, &ai, &g_pool_ds);
+    if (r != VK_SUCCESS) { LOG("[RED] vk: pool set allocation failed (%d): draws of pool shaders are left out", (int)r); g_pool_ds = VK_NULL_HANDLE; return 0; }
+    uint64_t t0 = now_ns();
+    for (int c = 0; c < SPV_PC_N; c++) {   // every entry its class's stand-in: an ID past the registrations reads black, never an unwritten descriptor
+        g_ps.view[c] = malloc(cap * sizeof *g_ps.view[c]);
+        VkDescriptorImageInfo *ii = malloc(cap * sizeof *ii);
+        for (uint32_t k = 0; k < cap; k++) { g_ps.view[c][k] = g_pool_dummy[c]; ii[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, g_pool_dummy[c], VK_IMAGE_LAYOUT_GENERAL}; }
+        VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_pool_ds, (uint32_t)c, 0, cap, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ii};
+        vkUpdateDescriptorSets(g_dev, 1, &w, 0, NULL); free(ii);
+    }
+    g_ps.samp = malloc(SPV_POOL_SAMP_CAP * sizeof *g_ps.samp);
+    { VkDescriptorImageInfo ii[SPV_POOL_SAMP_CAP]; for (int k = 0; k < SPV_POOL_SAMP_CAP; k++) { g_ps.samp[k] = g_dummy_samp; ii[k] = (VkDescriptorImageInfo){g_dummy_samp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; }
+      VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_pool_ds, SPV_POOL_SAMP, 0, SPV_POOL_SAMP_CAP, VK_DESCRIPTOR_TYPE_SAMPLER, ii}; vkUpdateDescriptorSets(g_dev, 1, &w, 0, NULL); }
+    g_ps.v = calloc(cap, sizeof *g_ps.v);
+    lk_(&g_rmu, LW_RMU); g_pool_live = 1; pthread_mutex_unlock(&g_rmu);   // registrations from now on are marked (pool_mark); the first sync resolves every ID anyway
+    LOG("vk: pool set made: %u IDs x %d classes + %d samplers, filled with stand-ins in %.1f ms; %d shaders read it so far (%d left as before)",
+        cap, SPV_PC_N, SPV_POOL_SAMP_CAP, (now_ns() - t0) / 1e6, g_pool_shaders, g_pool_refused);
+    return 1;
+}
+// The class a registered texture's view has (spv_pool.h SPV_PC_*), -1 when no binding of the set can hold it
+static int pset_class(const treg_t *tr) {
+    int target = tr->has_v && tr->v.set_target ? tr->v.target : tr->t.d.target;
+    switch (target) {
+    case NVN_TEXTURE_TARGET_2D: case NVN_TEXTURE_TARGET_RECTANGLE: return SPV_PC_2D;
+    case NVN_TEXTURE_TARGET_2D_ARRAY: return SPV_PC_2DA;
+    case NVN_TEXTURE_TARGET_3D: return SPV_PC_3D;
+    case NVN_TEXTURE_TARGET_CUBEMAP: return SPV_PC_CUBE;
+    default: return -1;
+    }
+}
+static int vk_fmt_int(VkFormat f) {   // an integer format: a float-sampled binding cannot hold its view
+    switch (f) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_B8G8R8A8_SINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_A2R10G10B10_UINT_PACK32:
+    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT:
+    case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: case VK_FORMAT_S8_UINT: return 1;
+    default: return 0;
+    }
+}
+// Entry k (host texture ID tb + k) as the registrations hold it now: the view of its texture in its class's binding (made and uploaded as a slot's would be), stand-ins elsewhere
+static void pool_resolve(int tb, uint32_t k) {
+    int hid = tb + (int)k; treg_t tr = {0};
+    if (hid > 0) { lk_(&g_rmu, LW_RMU); if (hid < g_ntreg) tr = g_treg[hid]; pthread_mutex_unlock(&g_rmu); }
+    vtex *nv = NULL; VkImageView view = VK_NULL_HANDLE; int cls = tr.ok ? pset_class(&tr) : -1;
+    int stencil = tr.has_v && tr.v.set_dsmode ? tr.v.dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL : tr.t.stencil;
+    if (cls >= 0 && !stencil) {
+        vtex *v = tex_get(&tr.t, 0);
+        if (v && v->img) { VkImageView tv = tex_view(v, &tr.t, &tr.v, tr.has_v, -1, 0); if (tv && !vk_fmt_int(g_tv_fmt)) { view = tv; nv = v; } }
+        g_pool_made += v != NULL;
+    }
+    for (int c = 0; c < SPV_PC_N; c++) {
+        VkImageView want = c == cls && view ? view : g_pool_dummy[c];
+        if (g_ps.view[c][k] != want) { g_ps.view[c][k] = want; pool_write(c, k, want, VK_NULL_HANDLE); }
+    }
+    vtex *old = g_ps.v[k];
+    if (old != nv) {
+        if (old) { __atomic_store_n(&old->pool_out, g_fence + 1, __ATOMIC_RELEASE); __atomic_sub_fetch(&old->inpool, 1, __ATOMIC_ACQ_REL); }   // freed after the submission being recorded
+        if (nv) __atomic_add_fetch(&nv->inpool, 1, __ATOMIC_ACQ_REL);
+        g_ps.v[k] = nv;
+    }
+}
+// The pool set for this draw, brought up to date: everything at the first sync or when the bound pools' bases change, else only what changed since the last one
+static VkDescriptorSet pool_set(void) {
+    if (!g_pool_ds && !pool_init()) return VK_NULL_HANDLE;
+    int tb = S.tex_base, sb = S.samp_base; uint32_t cap = pool_cap();
+    uint64_t reg = atomic_load(&g_reg_gen), kill = atomic_load(&g_pool_kill), cpu = atomic_load(&g_pool_cpu), sgen = atomic_load(&g_pool_sgen);
+    int full = !g_ps.synced || tb != g_ps.tb || sb != g_ps.sb;
+    if (!full && reg == g_ps.reg && kill == g_ps.kill && cpu == g_ps.cpu && sgen == g_ps.sgen) { g_pool_fast++; return g_pool_ds; }
+    uint64_t t0 = now_ns(); int nres = 0;
+    if (full) {
+        lk_(&g_rmu, LW_RMU); if (g_pool_dbits) memset(g_pool_dbits, 0, g_pool_ndw * sizeof *g_pool_dbits); int nt = g_ntreg; pthread_mutex_unlock(&g_rmu);
+        for (uint32_t k = 0; k < cap; k++) {
+            if (tb + (int)k >= nt && !g_ps.v[k]) { int any = 0; for (int c = 0; c < SPV_PC_N; c++) any |= g_ps.view[c][k] != g_pool_dummy[c]; if (!any) continue; }   // past the registrations: a stand-in already
+            pool_resolve(tb, k); nres++;
+        }
+        int tn = atomic_load(&g_tpool_n); if (tn > tb + (int)cap) { static int nl; if (nl++ < 4) LOG("[RED] vk: pool set: the texture pools hold %d IDs, the set %u from base %d: the IDs past it read black (DM_VK_POOL_CAP)", tn, cap, tb); }
+    } else {
+        if (reg != g_ps.reg) {   // the IDs registered since
+            static int *ids; static int cids; int nids = 0;
+            lk_(&g_rmu, LW_RMU);
+            for (int w = 0; w < g_pool_ndw; w++) for (uint64_t m = g_pool_dbits[w]; m; m &= m - 1) {
+                int id = w * 64 + __builtin_ctzll(m) - tb; if (id < 0 || id >= (int)cap) continue;
+                if (nids == cids) { cids = cids ? 2 * cids : 1024; ids = realloc(ids, cids * sizeof *ids); } ids[nids++] = id; }
+            if (g_pool_dbits) memset(g_pool_dbits, 0, g_pool_ndw * sizeof *g_pool_dbits);
+            pthread_mutex_unlock(&g_rmu);
+            for (int i = 0; i < nids; i++) pool_resolve(tb, (uint32_t)ids[i]);
+            nres += nids;
+        }
+        if (kill != g_ps.kill) for (uint32_t k = 0; k < cap; k++) if (g_ps.v[k] && g_ps.v[k]->dead) { pool_resolve(tb, k); nres++; }   // released while held: what the ID holds now
+        if (cpu != g_ps.cpu) for (uint32_t k = 0; k < cap; k++) if (g_ps.v[k] && g_ps.v[k]->dirty) {   // written by the CPU: uploaded again as a slot's use would
+            int hid = tb + (int)k; treg_t tr = {0}; lk_(&g_rmu, LW_RMU); if (hid < g_ntreg) tr = g_treg[hid]; pthread_mutex_unlock(&g_rmu);
+            if (tr.ok && tr.t.serial == g_ps.v[k]->serial) tex_get(&tr.t, 0); else pool_resolve(tb, k);
+            nres++;
+        }
+    }
+    if (full || sgen != g_ps.sgen) {
+        lk_(&g_rmu, LW_RMU);
+        for (int k = 0; k < SPV_POOL_SAMP_CAP; k++) { VkSampler sm = sb + k > 0 ? samp_get(sb + k) : g_dummy_samp; if (g_ps.samp[k] != sm) { g_ps.samp[k] = sm; pool_write(SPV_POOL_SAMP, (uint32_t)k, VK_NULL_HANDLE, sm); } }
+        pthread_mutex_unlock(&g_rmu);
+    }
+    int nw = g_pnw; pool_flush();
+    g_ps.tb = tb; g_ps.sb = sb; g_ps.synced = 1; g_ps.reg = reg; g_ps.kill = kill; g_ps.cpu = cpu; g_ps.sgen = sgen;
+    uint64_t dt = now_ns() - t0; g_pool_ns += dt;
+    if (g_pool_syncs++ < 8 || g_pool_syncs % 1000 == 0 || dt > 20000000)
+        LOG("vk: pool set sync %llu%s: %d IDs resolved, %d entries written, %.2f ms (in all: %llu syncs, %llu without a change, %llu entries, %.0f ms; textures looked up %llu)",
+            (unsigned long long)g_pool_syncs, full ? " (all IDs)" : "", nres, nw, dt / 1e6, (unsigned long long)g_pool_syncs, (unsigned long long)g_pool_fast, (unsigned long long)g_pool_writes,
+            g_pool_ns / 1e6, (unsigned long long)g_pool_made);
+    return g_pool_ds;
+}
 static VkDescriptorSet write_set_(shader_t *s, int stage) {
     if (stage == 5) g_nwb = 0;
     g_ndyno = 0;
@@ -4310,6 +4542,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     sets[1] = VK_NULL_HANDLE; if (fs) { sets[1] = write_set(fs, 1); memcpy(dyno + ndyno, g_dyno, g_ndyno * 4); ndyno += g_ndyno; }
     g_fb_n = 0;
     VkDescriptorSet gset = VK_NULL_HANDLE; if (gs) { gset = write_set(gs, 2); memcpy(gdyno, g_dyno, g_ndyno * 4); ngdyno = g_ndyno; }
+    VkDescriptorSet pset = VK_NULL_HANDLE; if (fs && fs->pool && !(pset = pool_set())) SKIP(6);   // the pool set, kept up to date with the registrations (vk_pool)
     if (!sets[0] || (fs && !sets[1]) || (gs && !gset)) SKIP(6);
     for (int a = 0; a < P.n; a++) if (S.chmask.mask >> (4 * a) & 0xf) P.cwr[a] = P.cdrawn[a] = P.pw_c[a] = 1;
     if (P.dt && ((S.ds.dt && S.ds.dw) || S.ds.st)) P.ddrawn = P.pw_d = 1;   // depth writes, or a stencil test (its ops may write)
@@ -4324,6 +4557,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         }
     }
     if (gs) { vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 2, 1, &gset, ngdyno, gdyno); g_ds_last.ds_ok = 0; }
+    if (pset) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, SPV_POOL_SET, 1, &pset, 0, NULL);
     // NVN's upper-left origin keeps D3D's y-up clip space; Vulkan's is y-down: the viewport is flipped (negative height)
     float x = 0, y = 0, w = (float)P.w, h = (float)P.h;
     if (S.has_vp) { x = S.vp[0][0]; y = S.vp[0][1]; w = S.vp[0][2]; h = S.vp[0][3]; }
