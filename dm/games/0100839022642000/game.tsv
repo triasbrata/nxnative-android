@@ -52,4 +52,5 @@ shader_half_clamp	on
 # secondary allocator (mmap + memset, 25% of all CPU; the frees at the pool reset on dm-complete, munmap). GW_SHADOW gives the cull dispatches' instance lists, read 16 bytes in, an aligned
 # copy right after the dispatch; MALLOC_CACHE keeps 128 freed driver blocks of at most 2 MB instead of 32 (about one
 # frame's passes once GW_SHADOW takes the breaks; worst case 256 MB idle, purged with malloc under real memory pressure); WB_PREP unprotects the pages a write-back writes instead of a fault per page.
-host_env	DM_VK_RING_REUSE=1 DM_VK_IDXPOOL_KEEP=1 DM_VK_GW_PAD=1 DM_VK_GW_LCACHE=1 DM_VK_GW_SHADOW=1 DM_VK_WB_PREP=1 DM_MALLOC_CACHE=128:2
+# hm-fix-2d: GW_PAD_SMALL retries a refused padded window at 256 / 64 bytes (the indirect argument records next to the cull's instance lists: ~170 composes a frame outdoors).
+host_env	DM_VK_RING_REUSE=1 DM_VK_IDXPOOL_KEEP=1 DM_VK_GW_PAD=1 DM_VK_GW_LCACHE=1 DM_VK_GW_SHADOW=1 DM_VK_WB_PREP=1 DM_MALLOC_CACHE=128:2 DM_VK_GW_PAD_SMALL=1

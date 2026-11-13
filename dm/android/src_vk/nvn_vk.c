@@ -3142,7 +3142,13 @@ static dcopy g_dc[NDC]; static int g_ndc;
 // offsets, with new texel buffer views and new descriptor sets (14% of the sets reused, 12 ms a frame in descriptor sets)
 enum { NWLOG = 8192 };
 static uint64_t g_wlo[NWLOG], g_whi[NWLOG];
-static void pad_retire(uint64_t a, uint64_t n); static int gw_pad_on(void); static int g_padw_n;
+static void pad_retire(uint64_t a, uint64_t n); // DM_VK_GW_PAD_SMALL=1 (hm-fix-2d; Harvest Moon's profile). Outdoors ~170 composes a frame were indirect draws reading a 20-byte argument record whose instance count (4 bytes at
+// +4) a buffer copy had just taken from a cull dispatch's counter: GW_PAD refused the 4 KB window around it because the same page holds this submission's dispatch writes (the
+// instance lists), so each draw composed with a pass break. When the 4 KB window is refused that way, a 256-byte and then a 64-byte window around the copy are tried. Counted in the
+// GW_PAD line (windows made by size)
+static int pad_small_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_PAD_SMALL"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_PAD_SMALL=1: refused padded windows retried at 256 and 64 bytes"); } return v; }
+static uint64_t g_pad_small[3];
+static int gw_pad_on(void); static int g_padw_n;
 static void wlog_add_(uint64_t a, uint64_t n, int retire);
 static void wlog_add(uint64_t a, uint64_t n) { wlog_add_(a, n, 1); }
 static void wlog_add_(uint64_t a, uint64_t n, int retire) {
@@ -5078,6 +5084,14 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
                 why = newer ? 2 : 4;   // a newer write there, or its list of GPU-written parts is full: the old way (an exact entry over the window, newer)
             }
         }
+        if (!why && pad_small_on()) {   // DM_VK_GW_PAD_SMALL: the 4 KB window holds this submission's dispatch writes: a 256- or 64-byte one around dst (the scan below decides, as before)
+            lk_(&g_gwmu, LW_GWMU);
+            static const uint64_t wsz[3] = {4096, 256, 64};
+            for (int z = 0; z < 3; z++) { uint64_t l = dst & ~(wsz[z] - 1), h = l + wsz[z]; if (base && l < base) l = base; if (base && h > base + psz) h = base + psz; if (dst < l || dst + n > h) break;
+                int bad = 0; for (int i = 0; i < g_ngw && !bad; i++) if (!GW_MISS(i, l, h - l) && g_gw[i].fence == g_fence + 1 && (!g_gw[i].exact || g_gw[i].pad || g_gw[i].dfr)) bad = 1;
+                lo = l; hi = h; if (!bad) { g_pad_small[z]++; break; } }
+            pthread_mutex_unlock(&g_gwmu);
+        }
         VkDeviceSize ro = !why ? ring_alloc(hi - lo, 256) : VK_WHOLE_SIZE; uint8_t *snap = ro != VK_WHOLE_SIZE ? snap_alloc(hi - lo) : NULL;
         if (!why && !snap) why = 3;
         padw_t *w = !why ? padw_new() : NULL; if (!why && !w) why = 3;
@@ -6036,8 +6050,8 @@ static void h0_lines(void) {
                                g_ipk_hit = g_ipk_syncs = g_ipk_full = g_ipk_pages = g_ipk_fb_flight = g_ipk_fb_dirty = g_ipk_fb_other = g_ipk_bad = g_ipk_late = g_ipk_fb_hwl = g_ipk_hwl_pages = 0; }
     LOG("vk: DM_VK_GW_SHADOW %d per frame over the last 600: aligned copies made after dispatches %.1f, reads remembered (new or changed) %.2f; composes over this submission's dispatch ranges %.1f (inside the range, misaligned %.1f; past its end or before its start %.1f), passes ended for composes %.1f",
         gw_shadow_on(), g_shl_made / 600.0, g_shl_learn / 600.0, (g_shl_cin + g_shl_cout) / 600.0, g_shl_cin / 600.0, g_shl_cout / 600.0, g_shl_brk / 600.0); g_shl_made = g_shl_learn = g_shl_brk = g_shl_cin = g_shl_cout = 0;
-    if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f, this submission's %.1f; windows retired by an in-stream write %.1f (exact entries left from their parts %.1f); not padded: no pool %.1f, this submission's non-exact or overlapping GPU writes there (or newer than the window) %.1f, no room or too many parts %.1f; GPU-written entries forgotten at the cap of %d %llu",
-                           g_pad_n / 600.0, g_pad_into / 600.0, g_pad_over / 600.0, g_pad_cur / 600.0, g_pad_retired / 600.0, g_pad_parts / 600.0, g_pad_why[1] / 600.0, g_pad_why[2] / 600.0, (g_pad_why[3] + g_pad_why[4]) / 600.0, (int)NGW, (unsigned long long)g_gw_dropped); g_pad_n = g_pad_into = g_pad_over = g_pad_cur = g_pad_retired = g_pad_parts = 0; memset(g_pad_why, 0, sizeof g_pad_why); }
+    if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f, this submission's %.1f; windows retired by an in-stream write %.1f (exact entries left from their parts %.1f); not padded: no pool %.1f, this submission's non-exact or overlapping GPU writes there (or newer than the window) %.1f, no room or too many parts %.1f; GPU-written entries forgotten at the cap of %d %llu; DM_VK_GW_PAD_SMALL %d: clean windows by size 4096/256/64 %.1f/%.1f/%.1f",
+                           g_pad_n / 600.0, g_pad_into / 600.0, g_pad_over / 600.0, g_pad_cur / 600.0, g_pad_retired / 600.0, g_pad_parts / 600.0, g_pad_why[1] / 600.0, g_pad_why[2] / 600.0, (g_pad_why[3] + g_pad_why[4]) / 600.0, (int)NGW, (unsigned long long)g_gw_dropped, pad_small_on(), g_pad_small[0] / 600.0, g_pad_small[1] / 600.0, g_pad_small[2] / 600.0); memset(g_pad_small, 0, sizeof g_pad_small); g_pad_n = g_pad_into = g_pad_over = g_pad_cur = g_pad_retired = g_pad_parts = 0; memset(g_pad_why, 0, sizeof g_pad_why); }
     if (idxpool_once_mode()) { LOG("vk: DM_VK_IDXPOOL_ONCE per frame over the last 600: pool copies %.2f (%.2f MB), draws bound to one %.1f, left to the old copy %.2f, copied again after a write-back landed in it %.2f, verify differences %.2f",
                                    g_ipo_copy / 600.0, g_ipo_bytes / 600.0 / 1048576.0, g_ipo_hit / 600.0, g_ipo_fallback / 600.0, g_ipo_hwl / 600.0, g_ipo_bad / 600.0); g_ipo_copy = g_ipo_bytes = g_ipo_hit = g_ipo_fallback = g_ipo_bad = g_ipo_hwl = 0; }
     if (ring_reuse_on()) { LOG("vk: DM_VK_RING_REUSE over the last 600 frames: rings of idle contexts given back %llu, extra rings sized from the overflow %llu (recent overflow %.1f MB); %d extra rings kept (%.0f MB)",
