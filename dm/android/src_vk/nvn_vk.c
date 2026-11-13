@@ -775,6 +775,11 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
             atomic_fetch_add(&g_gw_held, 1);
         } else if (!fits) {   // this submission's own write, not covering the read (or at an offset the binding cannot take): composed (gw_compose)
             if (inside) g_shl_cin++; else g_shl_cout++;
+            if (!h0_on() && may_hold) { static uint64_t nc; nc++; if (!(nc & (nc - 1)) && nc >= 64) {   // hm-fix-2: composes no. 64, 128, 256 ... (up to ~2^24) in full, as H0's first 16, for the outdoor geometry
+                int nov = 0, nex = 0; for (int k = 0; k < g_ngw; k++) if (!GW_MISS(k, addr, size)) { nov++; nex += g_gw[k].exact; }
+                LOG("vk: compose %llu over this submission's write: read %#llx +%llu (align %llu, caller %d) over entry %#llx +%llu (%s); %d entries overlap (%d exact copies'); past its end by %lld, before its start by %lld",
+                    (unsigned long long)nc, (unsigned long long)addr, (unsigned long long)size, (unsigned long long)align, g_h0_caller, (unsigned long long)e->addr, (unsigned long long)e->size, e->exact ? "an exact copy's" : "a dispatch's", nov, nex,
+                    addr + size > e->addr + e->size ? (long long)(addr + size - e->addr - e->size) : 0LL, addr < e->addr ? (long long)(e->addr - addr) : 0LL); } }
             if (inside && gw_shadow_on() && !e->exact) shl_learn(e->addr, e->size, addr - e->addr, size);   // DM_VK_GW_SHADOW: next time the dispatch is recorded, this read gets its own aligned copy
             if (may_hold) { if (h0_on()) h0_compose(addr, size, align, e); VkDeviceSize ro = gw_compose(addr, size, align < 16 ? 16 : align);
                             if (ro != VK_WHOLE_SIZE) { *buf = C->ring; *off = ro; if (p) *p = C->ringp + ro; g_gw_ci = g_ci; hit = 1; atomic_fetch_add(&g_gw_copied, 1); break; } }
@@ -4026,7 +4031,7 @@ static int idxpool_keep_mode(void) { static int v = -1; if (v < 0) { const char 
 enum { IPK_NP = 8, IPK_NCMAX = 3 };
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; uint64_t stamp, fence, hseq; int valid; } ipk_copy;   // hseq: the host write-back log at the sync (hwl)
 static struct { uint64_t base, size, regid, last; const void *span; ipk_copy c[IPK_NCMAX]; int cur; uint64_t cur_fence; int refused, hot; uint64_t refused_ns; } g_ipk[IPK_NP];   // hot: syncs in a row that copied over half the pool
-static uint64_t g_ipk_hit, g_ipk_full, g_ipk_pages, g_ipk_syncs, g_ipk_fb_flight, g_ipk_fb_dirty, g_ipk_fb_other, g_ipk_bad, g_ipk_bytes_live, g_ipk_hwl_pages, g_ipk_fb_hwl;
+static uint64_t g_ipk_late; static uint64_t g_ipk_hit, g_ipk_full, g_ipk_pages, g_ipk_syncs, g_ipk_fb_flight, g_ipk_fb_dirty, g_ipk_fb_other, g_ipk_bad, g_ipk_bytes_live, g_ipk_hwl_pages, g_ipk_fb_hwl;
 static int ipk_ncopies(void) { static int v; if (!v) { const char *e = getenv("DM_VK_IDXPOOL_KEEP_COPIES"); v = e && atoi(e) >= 1 ? atoi(e) : 2; if (v > IPK_NCMAX) v = IPK_NCMAX; } return v; }
 static void ipk_free_slot(int i) {   // every copy's fence done (the caller checked)
     for (int k = 0; k < IPK_NCMAX; k++) if (g_ipk[i].c[k].b) { vkDestroyBuffer(g_dev, g_ipk[i].c[k].b, NULL); vkFreeMemory(g_dev, g_ipk[i].c[k].m, NULL); g_ipk_bytes_live -= g_ipk[i].size; }
@@ -4109,11 +4114,22 @@ static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDevic
         if (!sr) { g_ipk[i].refused = 2; g_ipk_fb_other++; static int nl; if (nl++ < 4) LOG("vk: DM_VK_IDXPOOL_KEEP: pool %#llx +%llu cannot be protected: copied as before", (unsigned long long)base, (unsigned long long)psize); return 0; }
         c->fence = g_fence + 1; g_ipk[i].cur = best; g_ipk[i].cur_fence = g_fence + 1; fresh = 1;
         if (hwl_since(c->hseq, ibuf, ibuf + n)) { g_ipk_fb_hwl++; return 0; }   // a write-back while it synced (hm-fix-b)
+        if (nvn_dirty_since_span(span, (const void *)(uintptr_t)ibuf, (size_t)n, c->stamp)) { g_ipk_fb_dirty++; return 0; }   // hm-fix-2 (the f2_k2 verify): a CPU write after the sync's stamp, as for a later draw
     }
     // =2 (hm-fix-all): the whole pool compared once, right after a sync (about 3.5 pools of ~8 MB a frame outdoors); later draws of the submission rely on the dirty and
     // write-back checks above. =3: every draw's window compared (the old =2: ~60% of the recording thread outdoors, 11-11 profile)
     uint64_t vo = ibuf - base, vn = n;
     if (idxpool_keep_mode() == 2) { vo = 0; vn = fresh ? psize : 0; }
+    // hm-fix-2: pages written after the copy's stamp (or by a write-back since the sync) differ by design: a draw that can read one is refused by the checks above, so
+    // they are counted apart (the f2_k2 run: all 16 differences were such pages) and only a difference on a page untouched since the stamp is a stale copy
+    if (idxpool_keep_mode() >= 2 && vn && memcmp(c->p + vo, (const void *)(uintptr_t)(base + vo), vn)) {
+        uint64_t pgsz = pgm + 1, lo = vo, hi = vo + vn, bad = UINT64_MAX;
+        for (uint64_t q = lo & ~pgm; q < hi && bad == UINT64_MAX; q += pgsz) { uint64_t a = q > lo ? q : lo, e = q + pgsz < hi ? q + pgsz : hi;
+            if (!memcmp(c->p + a, (const void *)(uintptr_t)(base + a), e - a)) continue;
+            if (nvn_dirty_since_span(span, (const void *)(uintptr_t)(base + a), (size_t)(e - a), c->stamp) || hwl_since(c->hseq, base + a, base + e)) { g_ipk_late++; continue; }
+            bad = a; }
+        if (bad != UINT64_MAX) { vo = bad & ~pgm; vn = (hi - vo) < pgsz ? hi - vo : pgsz; }
+        else vn = 0; }
     if (idxpool_keep_mode() >= 2 && vn && memcmp(c->p + vo, (const void *)(uintptr_t)(base + vo), vn)) {
         c->valid = 0; g_ipk[i].cur_fence = 0;   // copied whole at its next sync; this submission's later draws take another copy
         ibuf = base + vo; n = vn;   // the line below reports the compared window
@@ -6015,9 +6031,9 @@ static void h0_tick(uint64_t n) {
 }
 // H0 (Harvest Moon plan v2): the per-600 lines; counters zeroed after. Called on the presenting thread with the other per-600 lines
 static void h0_lines(void) {
-    if (idxpool_keep_mode()) { LOG("vk: DM_VK_IDXPOOL_KEEP per frame over the last 600: draws bound to a kept copy %.1f; syncs %.2f (whole copies %.3f, pages copied %.1f = %.2f MB); left to the old copy: copy in flight %.2f, written since the copy %.2f, a host write-back since %.2f, other (untracked, too big, pressure) %.2f; pages copied for host write-backs %.1f; verify differences %.2f; kept %.0f MB",
-                                   g_ipk_hit / 600.0, g_ipk_syncs / 600.0, g_ipk_full / 600.0, g_ipk_pages / 600.0, g_ipk_pages * 4096.0 / 600.0 / 1048576.0, g_ipk_fb_flight / 600.0, g_ipk_fb_dirty / 600.0, g_ipk_fb_hwl / 600.0, g_ipk_fb_other / 600.0, g_ipk_hwl_pages / 600.0, g_ipk_bad / 600.0, g_ipk_bytes_live / 1048576.0);
-                               g_ipk_hit = g_ipk_syncs = g_ipk_full = g_ipk_pages = g_ipk_fb_flight = g_ipk_fb_dirty = g_ipk_fb_other = g_ipk_bad = g_ipk_fb_hwl = g_ipk_hwl_pages = 0; }
+    if (idxpool_keep_mode()) { LOG("vk: DM_VK_IDXPOOL_KEEP per frame over the last 600: draws bound to a kept copy %.1f; syncs %.2f (whole copies %.3f, pages copied %.1f = %.2f MB); left to the old copy: copy in flight %.2f, written since the copy %.2f, a host write-back since %.2f, other (untracked, too big, pressure) %.2f; pages copied for host write-backs %.1f; verify differences %.2f (on pages written since the copy, left to the checks: %.2f); kept %.0f MB",
+                                   g_ipk_hit / 600.0, g_ipk_syncs / 600.0, g_ipk_full / 600.0, g_ipk_pages / 600.0, g_ipk_pages * 4096.0 / 600.0 / 1048576.0, g_ipk_fb_flight / 600.0, g_ipk_fb_dirty / 600.0, g_ipk_fb_hwl / 600.0, g_ipk_fb_other / 600.0, g_ipk_hwl_pages / 600.0, g_ipk_bad / 600.0, g_ipk_late / 600.0, g_ipk_bytes_live / 1048576.0);
+                               g_ipk_hit = g_ipk_syncs = g_ipk_full = g_ipk_pages = g_ipk_fb_flight = g_ipk_fb_dirty = g_ipk_fb_other = g_ipk_bad = g_ipk_late = g_ipk_fb_hwl = g_ipk_hwl_pages = 0; }
     LOG("vk: DM_VK_GW_SHADOW %d per frame over the last 600: aligned copies made after dispatches %.1f, reads remembered (new or changed) %.2f; composes over this submission's dispatch ranges %.1f (inside the range, misaligned %.1f; past its end or before its start %.1f), passes ended for composes %.1f",
         gw_shadow_on(), g_shl_made / 600.0, g_shl_learn / 600.0, (g_shl_cin + g_shl_cout) / 600.0, g_shl_cin / 600.0, g_shl_cout / 600.0, g_shl_brk / 600.0); g_shl_made = g_shl_learn = g_shl_brk = g_shl_cin = g_shl_cout = 0;
     if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f, this submission's %.1f; windows retired by an in-stream write %.1f (exact entries left from their parts %.1f); not padded: no pool %.1f, this submission's non-exact or overlapping GPU writes there (or newer than the window) %.1f, no room or too many parts %.1f; GPU-written entries forgotten at the cap of %d %llu",
