@@ -4128,15 +4128,15 @@ static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDevic
     if (idxpool_keep_mode() == 2) { vo = 0; vn = fresh ? psize : 0; }
     // hm-fix-2: pages written after the copy's stamp (or by a write-back since the sync) differ by design: a draw that can read one is refused by the checks above, so
     // they are counted apart (the f2_k2 run: all 16 differences were such pages) and only a difference on a page untouched since the stamp is a stale copy
+    int stale = 0;   // a difference on a page untouched since the stamp (found once: comparing again would see the writes of other threads since, as f2_k2's 16 lines did)
     if (idxpool_keep_mode() >= 2 && vn && memcmp(c->p + vo, (const void *)(uintptr_t)(base + vo), vn)) {
         uint64_t pgsz = pgm + 1, lo = vo, hi = vo + vn, bad = UINT64_MAX;
         for (uint64_t q = lo & ~pgm; q < hi && bad == UINT64_MAX; q += pgsz) { uint64_t a = q > lo ? q : lo, e = q + pgsz < hi ? q + pgsz : hi;
             if (!memcmp(c->p + a, (const void *)(uintptr_t)(base + a), e - a)) continue;
             if (nvn_dirty_since_span(span, (const void *)(uintptr_t)(base + a), (size_t)(e - a), c->stamp) || hwl_since(c->hseq, base + a, base + e)) { g_ipk_late++; continue; }
             bad = a; }
-        if (bad != UINT64_MAX) { vo = bad & ~pgm; vn = (hi - vo) < pgsz ? hi - vo : pgsz; }
-        else vn = 0; }
-    if (idxpool_keep_mode() >= 2 && vn && memcmp(c->p + vo, (const void *)(uintptr_t)(base + vo), vn)) {
+        if (bad != UINT64_MAX) { vo = bad & ~pgm; vn = (hi - vo) < pgsz ? hi - vo : pgsz; stale = 1; } }
+    if (stale) {
         c->valid = 0; g_ipk[i].cur_fence = 0;   // copied whole at its next sync; this submission's later draws take another copy
         ibuf = base + vo; n = vn;   // the line below reports the compared window
         g_ipk_bad++; static int nl; if (nl++ < 16) { const uint8_t *a = c->p + (ibuf - base), *g = (const uint8_t *)(uintptr_t)ibuf; uint64_t f = 0; while (f < n && a[f] == g[f]) f++;
