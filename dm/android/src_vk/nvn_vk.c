@@ -4044,7 +4044,8 @@ enum { IPF_NOPOOL, IPF_BIG, IPF_PGALIGN, IPF_ISZ, IPF_LOWMEM, IPF_UNTRACKED, IPF
 static _Atomic uint64_t g_ipf[IPF_N], g_ipf_copies, g_ipf_bytes;
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; uint64_t stamp, fence, hseq; int valid; } ipk_copy;   // hseq: the host write-back log at the sync (hwl)
 static struct { uint64_t base, size, regid, last; const void *span; ipk_copy c[IPK_NCMAX]; int cur; uint64_t cur_fence; int refused, hot; uint64_t refused_ns; } g_ipk[IPK_NPMAX];   // hot: syncs in a row that copied over half the pool
-static uint64_t g_ipk_late; static uint64_t g_ipk_hit, g_ipk_full, g_ipk_pages, g_ipk_syncs, g_ipk_fb_flight, g_ipk_fb_dirty, g_ipk_fb_other, g_ipk_bad, g_ipk_bytes_live, g_ipk_hwl_pages, g_ipk_fb_hwl;
+static uint64_t g_ipk_late, g_ipk_rot;
+static int idxpool_rotate_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_IDXPOOL_ROTATE"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_IDXPOOL_ROTATE=1: a draw over pages written since this submission's kept copy syncs another copy"); } return v; } static uint64_t g_ipk_hit, g_ipk_full, g_ipk_pages, g_ipk_syncs, g_ipk_fb_flight, g_ipk_fb_dirty, g_ipk_fb_other, g_ipk_bad, g_ipk_bytes_live, g_ipk_hwl_pages, g_ipk_fb_hwl;
 static int ipk_ncopies(void) { static int v; if (!v) { const char *e = getenv("DM_VK_IDXPOOL_KEEP_COPIES"); v = e && atoi(e) >= 1 ? atoi(e) : 2; if (v > IPK_NCMAX) v = IPK_NCMAX; } return v; }
 static void ipk_free_slot(int i) {   // every copy's fence done (the caller checked)
     for (int k = 0; k < IPK_NCMAX; k++) if (g_ipk[i].c[k].b) { vkDestroyBuffer(g_dev, g_ipk[i].c[k].b, NULL); vkFreeMemory(g_dev, g_ipk[i].c[k].m, NULL); g_ipk_bytes_live -= g_ipk[i].size; }
@@ -4112,12 +4113,18 @@ static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDevic
     if (g_ipk[i].refused == 1 && now_ns() - g_ipk[i].refused_ns > 120000000000ull && ipk_idle(i)) { ipk_free_copies(i); g_ipk[i].refused = 0; g_ipk[i].hot = 0; }   // a hot pool: tried again (fresh copies) after 2 minutes, the game's use may have changed
     if (g_ipk[i].refused) { if (ipk_idle(i)) ipk_free_copies(i); g_ipk_fb_other++; g_ipf[IPF_REFUSED]++; return 0; }   // grill-risk re-check MED: a refused pool's copies are freed once the GPU is done with them
     g_ipk[i].span = span; g_ipk[i].last = g_fence + 1;
-    ipk_copy *c; int fresh = 0;
-    if (g_ipk[i].cur_fence == g_fence + 1) {   // this submission's copy: any page this draw can read written since its stamp makes the draw copy as before
+    ipk_copy *c = NULL; int fresh = 0, use_cur = g_ipk[i].cur_fence == g_fence + 1;
+    if (use_cur) {   // this submission's copy: any page this draw can read written since its stamp makes the draw copy as before
         c = &g_ipk[i].c[g_ipk[i].cur];
-        if (nvn_dirty_since_span(span, (const void *)(uintptr_t)ibuf, (size_t)n, c->stamp)) { g_ipk_fb_dirty++; g_ipf[IPF_DIRTY]++; return 0; }
-        if (hwl_since(c->hseq, ibuf, ibuf + n)) { g_ipk_fb_hwl++; g_ipf[IPF_HWL]++; return 0; }   // hm-fix-b
-    } else {   // a copy the GPU no longer reads, the most recently synced first
+        int dirty = nvn_dirty_since_span(span, (const void *)(uintptr_t)ibuf, (size_t)n, c->stamp), wb = !dirty && hwl_since(c->hseq, ibuf, ibuf + n);   // hm-fix-b
+        // DM_VK_IDXPOOL_ROTATE (hm-fix-3): the earlier draws of this submission keep that copy; this one syncs another copy the GPU is done with (the pages written since
+        // its stamp) and the submission's later draws take that one. The load into Bloomfield streamed index data into pools being drawn from: every draw fell back to an
+        // 8 MB copy of the pool (1-3.5 GB a second, 'written since the copy', the extra-ring burst behind the zero-copy run's low-memory kill)
+        if ((dirty || wb) && idxpool_rotate_on() && ipk_ncopies() > 1) { use_cur = 0; g_ipk_rot++; }
+        else if (dirty) { g_ipk_fb_dirty++; g_ipf[IPF_DIRTY]++; return 0; }
+        else if (wb) { g_ipk_fb_hwl++; g_ipf[IPF_HWL]++; return 0; }
+    }
+    if (!use_cur) {   // a copy the GPU no longer reads, the most recently synced first
         int best = -1; for (int k = 0; k < ipk_ncopies(); k++) { ipk_copy *x = &g_ipk[i].c[k]; if (x->b && x->fence > g_done) continue; if (best < 0 || (x->valid && (!g_ipk[i].c[best].valid || x->stamp > g_ipk[i].c[best].stamp))) best = k; }
         if (best < 0) { g_ipk_fb_flight++; g_ipf[IPF_NOCOPY]++; return 0; }
         c = &g_ipk[i].c[best];
@@ -6059,9 +6066,9 @@ static void h0_tick(uint64_t n) {
 }
 // H0 (Harvest Moon plan v2): the per-600 lines; counters zeroed after. Called on the presenting thread with the other per-600 lines
 static void h0_lines(void) {
-    if (idxpool_keep_mode()) { LOG("vk: DM_VK_IDXPOOL_KEEP per frame over the last 600: draws bound to a kept copy %.1f; syncs %.2f (whole copies %.3f, pages copied %.1f = %.2f MB); left to the old copy: copy in flight %.2f, written since the copy %.2f, a host write-back since %.2f, other (untracked, too big, pressure) %.2f; pages copied for host write-backs %.1f; verify differences %.2f (on pages written since the copy, left to the checks: %.2f); kept %.0f MB",
-                                   g_ipk_hit / 600.0, g_ipk_syncs / 600.0, g_ipk_full / 600.0, g_ipk_pages / 600.0, g_ipk_pages * 4096.0 / 600.0 / 1048576.0, g_ipk_fb_flight / 600.0, g_ipk_fb_dirty / 600.0, g_ipk_fb_hwl / 600.0, g_ipk_fb_other / 600.0, g_ipk_hwl_pages / 600.0, g_ipk_bad / 600.0, g_ipk_late / 600.0, g_ipk_bytes_live / 1048576.0);
-                               g_ipk_hit = g_ipk_syncs = g_ipk_full = g_ipk_pages = g_ipk_fb_flight = g_ipk_fb_dirty = g_ipk_fb_other = g_ipk_bad = g_ipk_late = g_ipk_fb_hwl = g_ipk_hwl_pages = 0; }
+    if (idxpool_keep_mode()) { LOG("vk: DM_VK_IDXPOOL_KEEP per frame over the last 600: draws bound to a kept copy %.1f; syncs %.2f (whole copies %.3f, pages copied %.1f = %.2f MB); left to the old copy: copy in flight %.2f, written since the copy %.2f, a host write-back since %.2f, other (untracked, too big, pressure) %.2f; pages copied for host write-backs %.1f; verify differences %.2f (on pages written since the copy, left to the checks: %.2f); rotated to another copy (DM_VK_IDXPOOL_ROTATE %d) %.2f; kept %.0f MB",
+                                   g_ipk_hit / 600.0, g_ipk_syncs / 600.0, g_ipk_full / 600.0, g_ipk_pages / 600.0, g_ipk_pages * 4096.0 / 600.0 / 1048576.0, g_ipk_fb_flight / 600.0, g_ipk_fb_dirty / 600.0, g_ipk_fb_hwl / 600.0, g_ipk_fb_other / 600.0, g_ipk_hwl_pages / 600.0, g_ipk_bad / 600.0, g_ipk_late / 600.0, idxpool_rotate_on(), g_ipk_rot / 600.0, g_ipk_bytes_live / 1048576.0);
+                               g_ipk_hit = g_ipk_syncs = g_ipk_full = g_ipk_pages = g_ipk_fb_flight = g_ipk_fb_dirty = g_ipk_fb_other = g_ipk_bad = g_ipk_late = g_ipk_rot = g_ipk_fb_hwl = g_ipk_hwl_pages = 0; }
     LOG("vk: DM_VK_GW_SHADOW %d per frame over the last 600: aligned copies made after dispatches %.1f, reads remembered (new or changed) %.2f; composes over this submission's dispatch ranges %.1f (inside the range, misaligned %.1f; past its end or before its start %.1f), passes ended for composes %.1f",
         gw_shadow_on(), g_shl_made / 600.0, g_shl_learn / 600.0, (g_shl_cin + g_shl_cout) / 600.0, g_shl_cin / 600.0, g_shl_cout / 600.0, g_shl_brk / 600.0); g_shl_made = g_shl_learn = g_shl_brk = g_shl_cin = g_shl_cout = 0;
     if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f, this submission's %.1f; windows retired by an in-stream write %.1f (exact entries left from their parts %.1f); not padded: no pool %.1f, this submission's non-exact or overlapping GPU writes there (or newer than the window) %.1f, no room or too many parts %.1f; GPU-written entries forgotten at the cap of %d %llu; DM_VK_GW_PAD_SMALL %d: clean windows by size 4096/256/64 %.1f/%.1f/%.1f",

@@ -52,5 +52,9 @@ shader_half_clamp	on
 # secondary allocator (mmap + memset, 25% of all CPU; the frees at the pool reset on dm-complete, munmap). GW_SHADOW gives the cull dispatches' instance lists, read 16 bytes in, an aligned
 # copy right after the dispatch; MALLOC_CACHE keeps 128 freed driver blocks of at most 2 MB instead of 32 (about one
 # frame's passes once GW_SHADOW takes the breaks; worst case 256 MB idle, purged with malloc under real memory pressure); WB_PREP unprotects the pages a write-back writes instead of a fault per page.
+# hm-fix-3 (11-13 tablet H0 run): standing still outdoors, the cull draws' GPU-written instances grew +155 a frame (24k -> 428k a frame) and the GPU time with them
+# (+25 ms per 600 frames): each frame's dispatch binds last frame's still-running range (chained, 361 a frame) and the game's CPU-side counter reset never reached it
+# (whole write-backs overwrote 150-230 KB of CPU writes a frame). GW_CHAIN_SNAP (C1) snapshots chained ranges and patches the CPU's rewrites in. The Mac (Metal) is flat
+# at ~10.5 ms GPU there. IDXPOOL_ROTATE: during the load, index data streamed into kept pools ('written since the copy' 130-446 draws a second, 8 MB copies each).
 # hm-fix-2d: GW_PAD_SMALL retries a refused padded window at 256 / 64 bytes (the indirect argument records next to the cull's instance lists: ~170 composes a frame outdoors).
-host_env	DM_VK_RING_REUSE=1 DM_VK_IDXPOOL_KEEP=1 DM_VK_GW_PAD=1 DM_VK_GW_LCACHE=1 DM_VK_GW_SHADOW=1 DM_VK_WB_PREP=1 DM_MALLOC_CACHE=128:2 DM_VK_GW_PAD_SMALL=1
+host_env	DM_VK_RING_REUSE=1 DM_VK_IDXPOOL_KEEP=1 DM_VK_GW_PAD=1 DM_VK_GW_LCACHE=1 DM_VK_GW_SHADOW=1 DM_VK_WB_PREP=1 DM_MALLOC_CACHE=128:2 DM_VK_GW_PAD_SMALL=1 DM_VK_GW_CHAIN_SNAP=1 DM_VK_IDXPOOL_ROTATE=1
