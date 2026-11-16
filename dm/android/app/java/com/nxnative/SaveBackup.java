@@ -29,7 +29,7 @@ import java.util.Locale;
 
 final class SaveBackup {
     private static final String TAG = "nxsave";
-    private static final int KEEP = 5;
+    private static final int KEEP = 5, KEEP_DAYS = 7;   // KEEP_DAYS: the first backup of each of the last 7 days stays as well
     private final Context ctx;
     private final File save, ext, backups;
     String last = "no backup line";   // the last line logged: MenuActivity hands it to the game's log (play_token)
@@ -108,7 +108,13 @@ final class SaveBackup {
             String[] all = backups.list(); List<String> timedDirs = new ArrayList<>();
             if (all != null) for (String n : all) if (n.matches("\\d{8}-\\d{6}(-imported)?")) timedDirs.add(n);
             java.util.Collections.sort(timedDirs);
-            for (int i = 0; i + KEEP < timedDirs.size(); i++) deleteTree(new File(backups, timedDirs.get(i)));
+            // The day's first backup is kept besides the last KEEP, for the last KEEP_DAYS days (11-17: a day of test launches rotated out the only copy of a
+            // player's AutoSave from that morning; every start of the menu makes a backup)
+            java.util.Set<String> firstOfDay = new java.util.HashSet<>(); String day = null; List<String> days = new ArrayList<>();
+            for (String n : timedDirs) { String d = n.substring(0, 8); if (!d.equals(day)) { day = d; firstOfDay.add(n); days.add(n); } }
+            while (days.size() > KEEP_DAYS) firstOfDay.remove(days.remove(0));
+            List<String> rot = new ArrayList<>(); for (String n : timedDirs) if (!firstOfDay.contains(n)) rot.add(n);
+            for (int i = 0; i + KEEP < rot.size(); i++) deleteTree(new File(backups, rot.get(i)));
             log("backup: " + a[0] + " files, " + a[1] + " bytes -> " + latest + " and " + timed.getName());
         } catch (Exception e) { log("backup failed: " + e); }
     }

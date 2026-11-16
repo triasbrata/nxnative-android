@@ -389,7 +389,10 @@ static int gw_pg_any(uint64_t addr, uint64_t size) {
 // beside g_gw (16 bytes an entry) instead of in the ~130-byte entries: hm9 walked 270 entries a lookup, 875 lookups a frame, with the lock held 10 ms a frame by the recording
 // thread. The arrays are kept in step with g_gw always (gw_add / gw_del / the oldest dropped); the switch only picks which the walks read. Same answers by construction
 static uint64_t g_gwa[NGW], g_gwe[NGW], g_gws[NGW];   // [i]: g_gw[i].addr, g_gw[i].addr + g_gw[i].size, g_gw[i].seq
-static int gw_index_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_INDEX"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_INDEX=1: GPU-written entries walked by their compact ranges"); } return v; }
+// hm-fix-4: the switch read once into g_gwi (GW_MISS evaluates it for every entry of every walk: as a call it was 3.5% of all CPU outdoors, f3_fair profile)
+static int g_gwi = -1;
+static int gw_index_init(void) { const char *e = getenv("DM_VK_GW_INDEX"); g_gwi = e && atoi(e) != 0; if (g_gwi) LOG("vk: DM_VK_GW_INDEX=1: GPU-written entries walked by their compact ranges"); return g_gwi; }
+static inline int gw_index_on(void) { return __builtin_expect(g_gwi >= 0, 1) ? g_gwi : gw_index_init(); }
 #define GW_MISS(i, lo, n) (gw_index_on() ? ((lo) >= g_gwe[i] || (lo) + (n) <= g_gwa[i]) : ((lo) >= g_gw[i].addr + g_gw[i].size || (lo) + (n) <= g_gw[i].addr))   // entry i does not overlap [lo, lo + n)
 static uint64_t g_gw_gen;   // bumped by every gw_add / gw_del (the entry set and its order changed: DM_VK_GW_LCACHE's answers are void); caller holds g_gwmu
 static void gw_del(int i) { g_gw_gen++; gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; g_gwa[i] = g_gwa[g_ngw]; g_gwe[i] = g_gwe[g_ngw]; g_gws[i] = g_gws[g_ngw]; }   // caller holds g_gwmu
@@ -462,7 +465,11 @@ static void gw_snap_follow(const uint8_t *dst, size_t n, const uint8_t *now, con
         if (!e->snap || e->fence <= fence) continue;
         uint64_t lo = e->addr > a ? e->addr : a, hi = e->addr + e->size < b ? e->addr + e->size : b, cnt = 0;
         uint8_t *es = (uint8_t *)(uintptr_t)e->snap;   // the snapshot buffers are the backend's own (snap_alloc)
-        for (uint64_t x = lo; x < hi; x++) { uint8_t v = now[x - a]; if ((!old || v != old[x - a]) && es[x - e->addr] != v) { es[x - e->addr] = v; cnt++; } }
+        for (uint64_t x = lo; x < hi;) {   // hm-fix-4: stretches where now = old (or now = the snapshot) skipped 64 and 8 bytes at a time
+            const uint8_t *nw = now + (x - a), *od = old ? old + (x - a) : NULL; uint8_t *sp = es + (x - e->addr);
+            if (x + 64 <= hi && ((od && !memcmp(nw, od, 64)) || !memcmp(nw, sp, 64))) { x += 64; continue; }
+            if (x + 8 <= hi && ((od && !memcmp(nw, od, 8)) || !memcmp(nw, sp, 8))) { x += 8; continue; }
+            uint8_t v = *nw; if ((!od || v != *od) && *sp != v) { *sp = v; cnt++; } x++; }
         if (cnt) { e->chk = 0; atomic_fetch_add(&g_cs_prop_b, cnt); atomic_fetch_add(&g_cs_prop_n, 1); }
     }
 }
@@ -963,7 +970,11 @@ static void ctx_complete(ctx_t *c) {
                     for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(dst + q, snap + q, 4)) { if (!memcmp(now + q, snap + q, 4)) kept++; else both++; }
                     atomic_fetch_add(&g_cs_kept_w, kept); atomic_fetch_add(&g_cs_both_w, both); } }
             uintptr_t wpg = UINTPTR_MAX;   // DM_VK_WB_PREP: the page last made writable (only pages with a changed word are)
-            for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { if (wbp && ((uintptr_t)(dst + i) & ~wb_pgm()) != wpg) { wpg = (uintptr_t)(dst + i) & ~wb_pgm(); wb_prep_page(dst + i, p->n - i); } memcpy(dst + i, now + i, 4); nw++; }
+            for (; i + 4 <= p->n;) {   // hm-fix-4: equal 64- and 8-byte stretches skipped (CHAIN_SNAP sends ~250 chained ranges a frame this way: dm-complete 20% of all CPU)
+                if (i + 64 <= p->n && !memcmp(now + i, snap + i, 64)) { i += 64; continue; }
+                if (i + 8 <= p->n && !memcmp(now + i, snap + i, 8)) { i += 8; continue; }
+                if (memcmp(now + i, snap + i, 4)) { if (wbp && ((uintptr_t)(dst + i) & ~wb_pgm()) != wpg) { wpg = (uintptr_t)(dst + i) & ~wb_pgm(); wb_prep_page(dst + i, p->n - i); } memcpy(dst + i, now + i, 4); nw++; }
+                i += 4; }
             for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
             // Its entries end here, not at gw_expire below (vk19.58): guest memory holds the GPU's words and the CPU's rewrites now, so a later read copies it from there.
             // Only the snapshot used to be cleared, and the entry lived on until the rest of the submission was written back: a read in between bound the ring's bytes
