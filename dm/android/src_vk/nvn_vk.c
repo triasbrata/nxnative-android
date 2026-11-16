@@ -477,7 +477,36 @@ static int gw_whole_dirty(gw_t *e) {
     if (e->chk != g_fence + 1) { e->chk = g_fence + 1; e->dirty = memcmp((const void *)(uintptr_t)e->addr, e->snap, e->size) != 0; g_stale_bytes += e->size; }
     return e->dirty;
 }
+// DM_VK_GW_ISW=1 (hm-fix-4b; Harvest Moon's profile). An in-stream write (a buffer copy from CPU memory, an inline update, a fill) recorded in submission S over a range an
+// earlier submission F's dispatch writes comes after that dispatch on the Switch's GPU timeline: S's readers must see it, and F's write-back must not undo it. The snapshot
+// compare cannot always tell: the cull's per-frame counter reset writes 0 over a snapshot that also holds 0 (F's write-back has not landed yet), so the chained dispatch kept
+// F's counter and the instance counts grew again whenever the GPU ran behind (hm_fix4 outdoors: 340-670 instances a frame, all 361 dispatch ranges chained; ~205 when not).
+// Such writes are listed (range, S); a read of F's range patches them in from guest memory (gw_cpu_dirty / gw_patch), and F's write-back skips their words. A write is
+// dropped from the list once S completes (every earlier submission completed before it). Under g_gwmu
+enum { NISW = 2048 };
+static struct { uint64_t lo, hi, fence; } g_isw[NISW]; static int g_nisw; static uint64_t g_isw_n, g_isw_full, g_isw_patch, g_isw_skip;
+static int gw_isw_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_ISW"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_ISW=1: in-stream writes over running GPU-written ranges are kept over them"); } return v; }
+static int isw_hits(uint64_t lo, uint64_t hi, uint64_t fence) { for (int k = 0; k < g_nisw; k++) if (g_isw[k].fence > fence && lo < g_isw[k].hi && g_isw[k].lo < hi) return 1; return 0; }
+static void isw_note(uint64_t a, uint64_t n) {   // recording thread: an in-stream CPU write [a, a + n) of submission g_fence + 1
+    if (!gw_isw_on() || !n || !__atomic_load_n(&g_ngw, __ATOMIC_RELAXED) || !gw_pg_any(a, n)) return;
+    lk_(&g_gwmu, LW_GWMU); int hit = 0;
+    for (int i = 0; i < g_ngw && !hit; i++) if (!GW_MISS(i, a, n) && g_gw[i].fence != g_fence + 1) hit = 1;
+    if (hit) { if (g_nisw == NISW) g_isw_full++; else { g_isw[g_nisw].lo = a; g_isw[g_nisw].hi = a + n; g_isw[g_nisw].fence = g_fence + 1; g_nisw++; g_isw_n++; } }
+    pthread_mutex_unlock(&g_gwmu); }
+// completion thread: the in-stream writes newer than submission `fence` over [lo, hi): their guest bytes saved before a write-back and put back after it (the
+// write-back must not undo a write the Switch's GPU would have done after it). Returns how many ranges went into the (small) save area
+typedef struct { uint64_t lo, hi; uint8_t *b; } isw_keep_t;
+static int isw_keep(uint64_t lo, uint64_t hi, uint64_t fence, isw_keep_t *kp, int max) {
+    int n = 0; if (!gw_isw_on()) return 0;
+    lk_(&g_gwmu, LW_GWMU);
+    for (int k = 0; k < g_nisw && n < max; k++) { if (g_isw[k].fence <= fence || hi <= g_isw[k].lo || g_isw[k].hi <= lo) continue;
+        uint64_t a = g_isw[k].lo > lo ? g_isw[k].lo : lo, b = g_isw[k].hi < hi ? g_isw[k].hi : hi; uint8_t *m = malloc(b - a); if (!m) continue;
+        memcpy(m, (const void *)(uintptr_t)a, b - a); kp[n].lo = a; kp[n].hi = b; kp[n].b = m; n++; }
+    pthread_mutex_unlock(&g_gwmu); return n; }
+static void isw_restore(isw_keep_t *kp, int n) { for (int k = 0; k < n; k++) { memcpy((void *)(uintptr_t)kp[k].lo, kp[k].b, kp[k].hi - kp[k].lo); free(kp[k].b); g_isw_skip++; } }
+static void isw_done(uint64_t fence) { int j = 0; for (int k = 0; k < g_nisw; k++) if (g_isw[k].fence > fence) g_isw[j++] = g_isw[k]; g_nisw = j; }   // under g_gwmu
 static int gw_cpu_dirty(gw_t *e, uint64_t lo, uint64_t hi) {
+    if (hi > lo && gw_isw_on() && g_nisw && isw_hits(lo, hi, e->fence)) return 1;   // DM_VK_GW_ISW
     if (!e->snap || hi <= lo || !stale_patch_on()) return 0;
     uint64_t t0 = stat_ns(); int r = gw_whole_dirty(e);   // the whole range: once a submission
     if (r && !(lo == e->addr && hi == e->addr + e->size)) { r = memcmp((const void *)(uintptr_t)lo, e->snap + (lo - e->addr), hi - lo) != 0; g_stale_bytes += hi - lo; }
@@ -607,8 +636,9 @@ static int gw_patch_cs(const uint8_t *g, const VkBufferCopy *rg, size_t nr, VkBu
     }
     return 1;
 }
+static void gw_isw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDeviceSize dst_off);
 static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDeviceSize dst_off) {
-    if (!e->snap) return;
+    if (!e->snap) { if (gw_isw_on() && g_nisw) gw_isw_patch(e, lo, hi, dst, dst_off); return; }   // DM_VK_GW_ISW: only the in-stream writes
     uint64_t t0 = now_ns();
     const uint8_t *g = (const uint8_t *)(uintptr_t)lo, *sn = e->snap + (lo - e->addr); uint64_t n = hi - lo;
     static VkBufferCopy *rg; static size_t crg; size_t nr = 0; uint64_t i = 0;   // the runs of rewritten words (exact: the bytes between them may be the GPU's); under g_gwmu
@@ -635,6 +665,18 @@ static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDe
         }
     }
     g_t_stale += now_ns() - t0; g_t_patch += now_ns() - t0;
+    if (gw_isw_on() && g_nisw) gw_isw_patch(e, lo, hi, dst, dst_off);
+}
+// DM_VK_GW_ISW: the in-stream writes newer than e over [lo, hi), copied from guest memory over dst (where lo lands) after whatever was copied there before (a full barrier
+// first: the snapshot patch may be a compute dispatch). Caller holds g_gwmu. gw_patch calls it after its own copies (or alone for an entry without a snapshot)
+static void gw_isw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDeviceSize dst_off) {
+    int first = 1;
+    for (int k = 0; k < g_nisw; k++) { if (g_isw[k].fence <= e->fence || hi <= g_isw[k].lo || g_isw[k].hi <= lo) continue;
+        uint64_t a = g_isw[k].lo > lo ? g_isw[k].lo : lo, b = g_isw[k].hi < hi ? g_isw[k].hi : hi;
+        VkDeviceSize st = ring_put((const void *)(uintptr_t)a, b - a, 16); if (st == VK_WHOLE_SIZE) continue;
+        if (first) { VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT};
+                     vkCmdPipelineBarrier(C->up, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL); first = 0; }
+        VkBufferCopy bc = {st, dst_off + (a - lo), b - a}; vkCmdCopyBuffer(C->up, C->ring, dst, 1, &bc); C->up_used = 1; g_isw_patch++; }
 }
 // A read over [addr, addr + size) that earlier submissions still running wrote parts of (Unreal binds its whole GPU-scene buffer; a dispatch updated a few records of it): the guest's
 // bytes copied into the ring, then each written part copied over them from its submission's ring at the start of this submission, oldest first (the upload command buffer; those
@@ -969,6 +1011,7 @@ static void ctx_complete(ctx_t *c) {
                 if (chain_snap_mode() == 2) { uint64_t kept = 0, both = 0;
                     for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(dst + q, snap + q, 4)) { if (!memcmp(now + q, snap + q, 4)) kept++; else both++; }
                     atomic_fetch_add(&g_cs_kept_w, kept); atomic_fetch_add(&g_cs_both_w, both); } }
+            isw_keep_t ik[8]; int nik = isw_keep((uint64_t)(uintptr_t)dst, (uint64_t)(uintptr_t)dst + p->n, c->fence_val, ik, 8);   // DM_VK_GW_ISW
             uintptr_t wpg = UINTPTR_MAX;   // DM_VK_WB_PREP: the page last made writable (only pages with a changed word are)
             for (; i + 4 <= p->n;) {   // hm-fix-4: equal 64- and 8-byte stretches skipped (CHAIN_SNAP sends ~250 chained ranges a frame this way: dm-complete 20% of all CPU)
                 if (i + 64 <= p->n && !memcmp(now + i, snap + i, 64)) { i += 64; continue; }
@@ -976,6 +1019,7 @@ static void ctx_complete(ctx_t *c) {
                 if (memcmp(now + i, snap + i, 4)) { if (wbp && ((uintptr_t)(dst + i) & ~wb_pgm()) != wpg) { wpg = (uintptr_t)(dst + i) & ~wb_pgm(); wb_prep_page(dst + i, p->n - i); } memcpy(dst + i, now + i, 4); nw++; }
                 i += 4; }
             for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
+            if (nik) isw_restore(ik, nik);
             // Its entries end here, not at gw_expire below (vk19.58): guest memory holds the GPU's words and the CPU's rewrites now, so a later read copies it from there.
             // Only the snapshot used to be cleared, and the entry lived on until the rest of the submission was written back: a read in between bound the ring's bytes
             // without the CPU's rewrites (gw_cpu_dirty answers 0 with no snapshot), stale for a frame. gw_del moves the last entry into slot k: k is looked at again
@@ -992,11 +1036,13 @@ static void ctx_complete(ctx_t *c) {
                            for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(g + q, h0s + q, 4) && memcmp(g + q, p->src + q, 4)) lost += 4;
                            atomic_fetch_add(&g_h0_lost_b, lost); atomic_fetch_add(&g_h0_lost_n, 1); free((void *)h0s); }
             if (chain_snap_mode()) { lk_(&g_gwmu, LW_GWMU); gw_snap_follow(p->dst, p->n, p->src, NULL, c->fence_val); pthread_mutex_unlock(&g_gwmu); }   // DM_VK_GW_CHAIN_SNAP
-            memcpy(p->dst, p->src, p->n); hwl_add(p->dst, p->n);
+            { isw_keep_t ik[8]; int nik = isw_keep((uint64_t)(uintptr_t)p->dst, (uint64_t)(uintptr_t)p->dst + p->n, c->fence_val, ik, 8);   // DM_VK_GW_ISW
+              memcpy(p->dst, p->src, p->n); if (nik) isw_restore(ik, nik); } hwl_add(p->dst, p->n);
             if (c->plog && p->n <= 64) { float f[16]; memcpy(f, p->src, p->n); LOG("plog: written back %#llx +%zu: %g %g %g %g%s", (unsigned long long)(uintptr_t)p->dst, p->n, f[0], p->n > 4 ? f[1] : 0, p->n > 8 ? f[2] : 0, p->n > 12 ? f[3] : 0, p->n > 16 ? " ..." : ""); } }
     }
     c->npost = 0;
     gw_expire(c->fence_val);
+    if (gw_isw_on()) { lk_(&g_gwmu, LW_GWMU); isw_done(c->fence_val); pthread_mutex_unlock(&g_gwmu); }   // DM_VK_GW_ISW: every submission up to it completed
     lk_(&g_gwmu, LW_GWMU); uint64_t hold = c->hold; H0_GWH_T0();
     for (int i = 0; i < c->nextra; i++) {
         int used = hold > c->fence_val; for (int k = 0; k < g_ngw && !used; k++) used = g_gw[k].buf == c->extra[i].b;
@@ -3163,6 +3209,7 @@ static int gw_pad_on(void); static int g_padw_n;
 static void wlog_add_(uint64_t a, uint64_t n, int retire);
 static void wlog_add(uint64_t a, uint64_t n) { wlog_add_(a, n, 1); }
 static void wlog_add_(uint64_t a, uint64_t n, int retire) {
+    if (retire) isw_note(a, n);   // DM_VK_GW_ISW: an in-stream CPU write (not the CPU side of a GPU copy)
     if (retire && gw_pad_on() && n && g_padw_n) pad_retire(a, n);   // DM_VK_GW_PAD: an in-stream write over a live window of this submission retires it (not the CPU side of a GPU copy, which the window gets)
     if (g_nwlog == NWLOG) { g_wgen++; g_nwlog = 0; g_h0_gen[2]++; return; }   // too many: a new generation (every copy taken again)
     g_wlo[g_nwlog] = a; g_whi[g_nwlog] = a + n; g_nwlog++;
@@ -6080,6 +6127,8 @@ static void h0_lines(void) {
     if (idxpool_keep_mode()) { LOG("vk: DM_VK_IDXPOOL_KEEP per frame over the last 600: draws bound to a kept copy %.1f; syncs %.2f (whole copies %.3f, pages copied %.1f = %.2f MB); left to the old copy: copy in flight %.2f, written since the copy %.2f, a host write-back since %.2f, other (untracked, too big, pressure) %.2f; pages copied for host write-backs %.1f; verify differences %.2f (on pages written since the copy, left to the checks: %.2f); rotated to another copy (DM_VK_IDXPOOL_ROTATE %d) %.2f; kept %.0f MB",
                                    g_ipk_hit / 600.0, g_ipk_syncs / 600.0, g_ipk_full / 600.0, g_ipk_pages / 600.0, g_ipk_pages * 4096.0 / 600.0 / 1048576.0, g_ipk_fb_flight / 600.0, g_ipk_fb_dirty / 600.0, g_ipk_fb_hwl / 600.0, g_ipk_fb_other / 600.0, g_ipk_hwl_pages / 600.0, g_ipk_bad / 600.0, g_ipk_late / 600.0, idxpool_rotate_on(), g_ipk_rot / 600.0, g_ipk_bytes_live / 1048576.0);
                                g_ipk_hit = g_ipk_syncs = g_ipk_full = g_ipk_pages = g_ipk_fb_flight = g_ipk_fb_dirty = g_ipk_fb_other = g_ipk_bad = g_ipk_late = g_ipk_rot = g_ipk_fb_hwl = g_ipk_hwl_pages = 0; }
+    if (gw_isw_on()) { LOG("vk: DM_VK_GW_ISW per frame over the last 600: in-stream writes over running GPU-written ranges %.1f (list full %.2f), patched into later reads %.1f, kept over write-backs %.1f; listed now %d",
+                           g_isw_n / 600.0, g_isw_full / 600.0, g_isw_patch / 600.0, g_isw_skip / 600.0, g_nisw); g_isw_n = g_isw_full = g_isw_patch = g_isw_skip = 0; }
     LOG("vk: DM_VK_GW_SHADOW %d per frame over the last 600: aligned copies made after dispatches %.1f, reads remembered (new or changed) %.2f; composes over this submission's dispatch ranges %.1f (inside the range, misaligned %.1f; past its end or before its start %.1f), passes ended for composes %.1f",
         gw_shadow_on(), g_shl_made / 600.0, g_shl_learn / 600.0, (g_shl_cin + g_shl_cout) / 600.0, g_shl_cin / 600.0, g_shl_cout / 600.0, g_shl_brk / 600.0); g_shl_made = g_shl_learn = g_shl_brk = g_shl_cin = g_shl_cout = 0;
     if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f, this submission's %.1f; windows retired by an in-stream write %.1f (exact entries left from their parts %.1f); not padded: no pool %.1f, this submission's non-exact or overlapping GPU writes there (or newer than the window) %.1f, no room or too many parts %.1f; GPU-written entries forgotten at the cap of %d %llu; DM_VK_GW_PAD_SMALL %d: clean windows by size 4096/256/64 %.1f/%.1f/%.1f",
