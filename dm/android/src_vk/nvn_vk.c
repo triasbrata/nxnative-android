@@ -461,6 +461,26 @@ static uint64_t hwl_now(void) { pthread_mutex_lock(&g_hwl_mu); uint64_t v = g_hw
 // the snapshots of the later live entries over them. Caller holds g_gwmu
 static void gw_snap_follow(const uint8_t *dst, size_t n, const uint8_t *now, const uint8_t *old, uint64_t fence) {
     uint64_t a = (uint64_t)(uintptr_t)dst, b = a + n;
+    // hm-fix-4b: with `old`, the bytes the write-back changed (now != old) are found once, as runs, and only they are put into each later entry's snapshot (the same bytes
+    // as the per-entry byte loop below writes: where now != old; writing a byte that already holds that value changes nothing). gw_snap_follow was 6.7% of all CPU
+    // in hm_fix4 (every one of ~360 chained ranges a frame compared again for each later entry over it). More than NRUN runs: the loop below, as before
+    enum { NRUN = 512 }; static uint32_t ra[NRUN], rb[NRUN]; int nr = 0, over = 0;
+    if (old) { for (size_t x = 0; x < n && !over;) {
+                   if (x + 64 <= n && !memcmp(now + x, old + x, 64)) { x += 64; continue; }
+                   if (x + 8 <= n && !memcmp(now + x, old + x, 8)) { x += 8; continue; }
+                   if (now[x] == old[x]) { x++; continue; }
+                   size_t y = x; while (y < n && now[y] != old[y]) y++;
+                   if (nr && ra[nr - 1] + 0 <= x && rb[nr - 1] + 8 >= x) rb[nr - 1] = (uint32_t)y; else if (nr == NRUN) over = 1; else { ra[nr] = (uint32_t)x; rb[nr] = (uint32_t)y; nr++; }
+                   x = y; }
+               if (!over) {
+                   if (!nr) return;   // nothing changed: no snapshot to follow
+                   for (int k = 0; k < g_ngw; k++) { if (a >= g_gwe[k] || b <= g_gwa[k]) continue; gw_t *e = &g_gw[k];
+                       if (!e->snap || e->fence <= fence) continue;
+                       uint64_t lo = e->addr > a ? e->addr : a, hi = e->addr + e->size < b ? e->addr + e->size : b, cnt = 0; uint8_t *es = (uint8_t *)(uintptr_t)e->snap;
+                       for (int r = 0; r < nr; r++) { uint64_t x0 = a + ra[r] > lo ? a + ra[r] : lo, x1 = a + rb[r] < hi ? a + rb[r] : hi; if (x0 >= x1) continue;
+                           for (uint64_t x = x0; x < x1; x++) { uint8_t v = now[x - a]; if (v != old[x - a] && es[x - e->addr] != v) { es[x - e->addr] = v; cnt++; } } }
+                       if (cnt) { e->chk = 0; atomic_fetch_add(&g_cs_prop_b, cnt); atomic_fetch_add(&g_cs_prop_n, 1); } }
+                   return; } }
     for (int k = 0; k < g_ngw; k++) { if (a >= g_gwe[k] || b <= g_gwa[k]) continue; gw_t *e = &g_gw[k];
         if (!e->snap || e->fence <= fence) continue;
         uint64_t lo = e->addr > a ? e->addr : a, hi = e->addr + e->size < b ? e->addr + e->size : b, cnt = 0;
