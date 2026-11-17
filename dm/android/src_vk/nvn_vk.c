@@ -5114,7 +5114,7 @@ static uint64_t g_pad_n, g_pad_into, g_pad_over, g_pad_why[5], g_pad_retired, g_
 // This submission's padded windows (recording thread only): each window's range and ring place, and the parts GPU copies wrote into it (the copy that made it, the copies that
 // went into it). An earlier submission's writes laid in and this submission's exact writes taken in are not listed: their own entries stay live and serve those bytes once the
 // window goes (grill-risk re-check: listing them made this submission's snapshot-less entries hide the earlier ones and their CPU-rewrite patching)
-enum { NPADW = 128, NPADSUB = 48 };
+enum { NPADW = 256, NPADSUB = 48 };   // hm-fix-4d: 256 windows (outdoors made 128.0 a frame, the cap, with "no room" refusals composing)
 typedef struct { uint64_t lo, hi, fence; VkBuffer buf; VkDeviceSize off; uint8_t *p; int nsub, dead; struct { uint64_t a, b; } sub[NPADSUB]; } padw_t;
 static padw_t g_padw[NPADW]; static int g_padw_n;
 static padw_t *padw_find(uint64_t a, uint64_t n) { for (int i = 0; i < g_padw_n; i++) { padw_t *w = &g_padw[i]; if (w->fence == g_fence + 1 && !w->dead && a >= w->lo && a + n <= w->hi) return w; } return NULL; }
