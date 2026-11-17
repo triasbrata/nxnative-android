@@ -513,17 +513,15 @@ static void isw_note(uint64_t a, uint64_t n) {   // recording thread: an in-stre
     for (int i = 0; i < g_ngw && !hit; i++) if (!GW_MISS(i, a, n) && g_gw[i].fence != g_fence + 1) hit = 1;
     if (hit) { if (g_nisw == NISW) g_isw_full++; else { g_isw[g_nisw].lo = a; g_isw[g_nisw].hi = a + n; g_isw[g_nisw].fence = g_fence + 1; g_nisw++; g_isw_n++; } }
     pthread_mutex_unlock(&g_gwmu); }
-// completion thread: the in-stream writes newer than submission `fence` over [lo, hi): their guest bytes saved before a write-back and put back after it (the
-// write-back must not undo a write the Switch's GPU would have done after it). Returns how many ranges went into the (small) save area
-typedef struct { uint64_t lo, hi; uint8_t *b; } isw_keep_t;
-static int isw_keep(uint64_t lo, uint64_t hi, uint64_t fence, isw_keep_t *kp, int max) {
+// completion thread: the in-stream writes newer than submission `fence` over [lo, hi), clipped, into rl/rh (at most max; under the lock only for this). A write-back
+// leaves them untouched: the Switch's GPU would have done them after it (review of 4b: skipping, not saving and putting back, so a game write meanwhile is not undone)
+static int isw_ranges(uint64_t lo, uint64_t hi, uint64_t fence, uint64_t *rl, uint64_t *rh, int max) {
     int n = 0; if (!gw_isw_on()) return 0;
     lk_(&g_gwmu, LW_GWMU);
     for (int k = 0; k < g_nisw && n < max; k++) { if (g_isw[k].fence <= fence || hi <= g_isw[k].lo || g_isw[k].hi <= lo) continue;
-        uint64_t a = g_isw[k].lo > lo ? g_isw[k].lo : lo, b = g_isw[k].hi < hi ? g_isw[k].hi : hi; uint8_t *m = malloc(b - a); if (!m) continue;
-        memcpy(m, (const void *)(uintptr_t)a, b - a); kp[n].lo = a; kp[n].hi = b; kp[n].b = m; n++; }
+        rl[n] = g_isw[k].lo > lo ? g_isw[k].lo : lo; rh[n] = g_isw[k].hi < hi ? g_isw[k].hi : hi; n++; }
     pthread_mutex_unlock(&g_gwmu); return n; }
-static void isw_restore(isw_keep_t *kp, int n) { for (int k = 0; k < n; k++) { memcpy((void *)(uintptr_t)kp[k].lo, kp[k].b, kp[k].hi - kp[k].lo); free(kp[k].b); g_isw_skip++; } }
+static inline int isw_in(uint64_t a, uint64_t b, const uint64_t *rl, const uint64_t *rh, int n) { for (int k = 0; k < n; k++) if (a < rh[k] && rl[k] < b) return 1; return 0; }
 static void isw_done(uint64_t fence) { int j = 0; for (int k = 0; k < g_nisw; k++) if (g_isw[k].fence > fence) g_isw[j++] = g_isw[k]; g_nisw = j; }   // under g_gwmu
 static int gw_cpu_dirty(gw_t *e, uint64_t lo, uint64_t hi) {
     if (hi > lo && gw_isw_on() && g_nisw && isw_hits(lo, hi, e->fence)) return 1;   // DM_VK_GW_ISW
@@ -1031,15 +1029,15 @@ static void ctx_complete(ctx_t *c) {
                 if (chain_snap_mode() == 2) { uint64_t kept = 0, both = 0;
                     for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(dst + q, snap + q, 4)) { if (!memcmp(now + q, snap + q, 4)) kept++; else both++; }
                     atomic_fetch_add(&g_cs_kept_w, kept); atomic_fetch_add(&g_cs_both_w, both); } }
-            isw_keep_t ik[8]; int nik = isw_keep((uint64_t)(uintptr_t)dst, (uint64_t)(uintptr_t)dst + p->n, c->fence_val, ik, 8);   // DM_VK_GW_ISW
+            uint64_t irl[8], irh[8]; int nir = isw_ranges((uint64_t)(uintptr_t)dst, (uint64_t)(uintptr_t)dst + p->n, c->fence_val, irl, irh, 8);   // DM_VK_GW_ISW: words left alone
             uintptr_t wpg = UINTPTR_MAX;   // DM_VK_WB_PREP: the page last made writable (only pages with a changed word are)
             for (; i + 4 <= p->n;) {   // hm-fix-4: equal 64- and 8-byte stretches skipped (CHAIN_SNAP sends ~250 chained ranges a frame this way: dm-complete 20% of all CPU)
                 if (i + 64 <= p->n && !memcmp(now + i, snap + i, 64)) { i += 64; continue; }
                 if (i + 8 <= p->n && !memcmp(now + i, snap + i, 8)) { i += 8; continue; }
-                if (memcmp(now + i, snap + i, 4)) { if (wbp && ((uintptr_t)(dst + i) & ~wb_pgm()) != wpg) { wpg = (uintptr_t)(dst + i) & ~wb_pgm(); wb_prep_page(dst + i, p->n - i); } memcpy(dst + i, now + i, 4); nw++; }
+                if (memcmp(now + i, snap + i, 4) && !(nir && isw_in((uint64_t)(uintptr_t)(dst + i), (uint64_t)(uintptr_t)(dst + i) + 4, irl, irh, nir))) { if (wbp && ((uintptr_t)(dst + i) & ~wb_pgm()) != wpg) { wpg = (uintptr_t)(dst + i) & ~wb_pgm(); wb_prep_page(dst + i, p->n - i); } memcpy(dst + i, now + i, 4); nw++; }
                 i += 4; }
-            for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
-            if (nik) isw_restore(ik, nik);
+            for (; i < p->n; i++) if (now[i] != snap[i] && !(nir && isw_in((uint64_t)(uintptr_t)(dst + i), (uint64_t)(uintptr_t)(dst + i) + 1, irl, irh, nir))) dst[i] = now[i];
+            if (nir) g_isw_skip += (uint64_t)nir;
             // Its entries end here, not at gw_expire below (vk19.58): guest memory holds the GPU's words and the CPU's rewrites now, so a later read copies it from there.
             // Only the snapshot used to be cleared, and the entry lived on until the rest of the submission was written back: a read in between bound the ring's bytes
             // without the CPU's rewrites (gw_cpu_dirty answers 0 with no snapshot), stale for a frame. gw_del moves the last entry into slot k: k is looked at again
@@ -1056,8 +1054,14 @@ static void ctx_complete(ctx_t *c) {
                            for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(g + q, h0s + q, 4) && memcmp(g + q, p->src + q, 4)) lost += 4;
                            atomic_fetch_add(&g_h0_lost_b, lost); atomic_fetch_add(&g_h0_lost_n, 1); free((void *)h0s); }
             if (chain_snap_mode()) { lk_(&g_gwmu, LW_GWMU); gw_snap_follow(p->dst, p->n, p->src, NULL, c->fence_val); pthread_mutex_unlock(&g_gwmu); }   // DM_VK_GW_CHAIN_SNAP
-            { isw_keep_t ik[8]; int nik = isw_keep((uint64_t)(uintptr_t)p->dst, (uint64_t)(uintptr_t)p->dst + p->n, c->fence_val, ik, 8);   // DM_VK_GW_ISW
-              memcpy(p->dst, p->src, p->n); if (nik) isw_restore(ik, nik); } hwl_add(p->dst, p->n);
+            { uint64_t irl[8], irh[8], d0 = (uint64_t)(uintptr_t)p->dst; int nir = isw_ranges(d0, d0 + p->n, c->fence_val, irl, irh, 8);   // DM_VK_GW_ISW: the gaps around them
+              if (!nir) memcpy(p->dst, p->src, p->n);
+              else { g_isw_skip += (uint64_t)nir;
+                     for (int a2 = 1; a2 < nir; a2++) for (int b2 = a2; b2 > 0 && irl[b2 - 1] > irl[b2]; b2--) { uint64_t t = irl[b2]; irl[b2] = irl[b2 - 1]; irl[b2 - 1] = t; t = irh[b2]; irh[b2] = irh[b2 - 1]; irh[b2 - 1] = t; }   // by start
+                     uint64_t x = d0, e = d0 + p->n;
+                     for (int k = 0; k <= nir; k++) { uint64_t gend = k < nir ? irl[k] : e;   // the gap [x, gend), then past the listed range
+                         if (gend > x) memcpy((uint8_t *)p->dst + (x - d0), p->src + (x - d0), gend - x);
+                         if (k < nir && irh[k] > x) x = irh[k]; } } } hwl_add(p->dst, p->n);
             if (c->plog && p->n <= 64) { float f[16]; memcpy(f, p->src, p->n); LOG("plog: written back %#llx +%zu: %g %g %g %g%s", (unsigned long long)(uintptr_t)p->dst, p->n, f[0], p->n > 4 ? f[1] : 0, p->n > 8 ? f[2] : 0, p->n > 12 ? f[3] : 0, p->n > 16 ? " ..." : ""); } }
     }
     c->npost = 0;
